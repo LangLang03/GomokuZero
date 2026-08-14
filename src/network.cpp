@@ -96,7 +96,7 @@ void fast_conv3x3_relu(const ConvLayer& layer, const float* input,
     const int depth = channels * 9;
     columns.resize(static_cast<size_t>(depth) * cells);
 
-    // im2col, with whole contiguous row copies instead of a branch per pixel.
+    // Build im2col by rows to keep padding checks out of the inner loop.
     for (int channel = 0; channel < channels; ++channel) {
         const float* plane = input + static_cast<size_t>(channel) * cells;
         for (int kr = 0; kr < 3; ++kr) {
@@ -121,8 +121,7 @@ void fast_conv3x3_relu(const ConvLayer& layer, const float* input,
 
     output.resize(static_cast<size_t>(outputs) * cells);
     const __m256 zero = _mm256_setzero_ps();
-    // A 6x16 tile fills the AVX2 register file while reusing every loaded
-    // input vector across six output channels.
+    // Six output channels fit the AVX2 register budget.
     int out = 0;
     for (; out + 6 <= outputs; out += 6) {
         int cell = 0;
@@ -166,8 +165,7 @@ void fast_conv3x3_relu(const ConvLayer& layer, const float* input,
             }
         }
     }
-    // At most four output channels remain. Keep one full spatial vector in
-    // registers so the tail does not repeatedly write partial sums.
+    // Handle remaining channels one vector at a time.
     for (; out < outputs; ++out) {
         int cell = 0;
         for (; cell + 8 <= cells; cell += 8) {
@@ -647,7 +645,7 @@ PureNet::PureNet(double lr) : adam_(lr) {
 PureNet::~PureNet() = default;
 
 void PureNet::init_params() {
-    // layer sizes are fixed by the layer structs; just ensure buffers exist
+    // Allocate fixed-size parameter buffers.
     auto ensure = [](std::vector<float>& w, size_t n) { w.resize(n); };
     ensure(c1_.w, 32 * 4 * 9);  ensure(c1_.b, 32);
     ensure(c2_.w, 64 * 32 * 9); ensure(c2_.b, 64);
@@ -742,8 +740,7 @@ bool PureNet::save(const std::string& dir) const {
 
 void PureNet::forward_impl(const float* state, float* policy,
                            float& value, bool probabilities) const {
-    // Each calling thread owns one workspace. This removes all allocations
-    // from the MCTS hot loop while keeping concurrent callers independent.
+    // One reusable workspace per inference thread.
     struct Workspace {
         std::vector<float> c1, c2, c3, pa, plogit, va, vh, vlogit;
         std::vector<float> columns;
@@ -814,7 +811,7 @@ void PureNet::forward_impl(const float* state, float* policy,
     value = std::tanh(ws.vlogit[0]);
 }
 
-// ---- forward for one state ----
+// Forward API.
 void PureNet::forward_one(const std::vector<float>& state,
                           std::vector<float>& log_policy, float& value) const {
     if (state.size() != 4 * 225)
@@ -885,7 +882,7 @@ void PureNet::set_cuda_enabled(bool enabled) {
     std::fprintf(stderr, "[net] switched to CUDA backend\n");
 }
 
-// ---- training step (batch) ----
+// Training.
 PureNet::TrainStats PureNet::train_step(
     const std::vector<float>& states, int B,
     const std::vector<float>& probs, const std::vector<float>& winners,
@@ -897,11 +894,9 @@ PureNet::TrainStats PureNet::train_step(
         throw std::invalid_argument("invalid training batch dimensions");
     if (cuda_enabled_)
         return cuda_backend_->train_step(states, B, probs, winners, lr);
-    // --- forward per sample, accumulate loss + gradients ---
-    // (network is tiny; per-sample forward/backward with gradient sum is
-    //  simpler than batched tensor ops and equally correct for the loss)
+    // Workers accumulate private gradients, reduced after the batch.
     adam_.set_lr(lr);
-    // zero gradients
+    // Clear destination gradients before reduction.
     c1_.gw.assign(c1_.w.size(), 0); c1_.gb.assign(c1_.b.size(), 0);
     c2_.gw.assign(c2_.w.size(), 0); c2_.gb.assign(c2_.b.size(), 0);
     c3_.gw.assign(c3_.w.size(), 0); c3_.gb.assign(c3_.b.size(), 0);
@@ -1123,11 +1118,9 @@ PureNet::TrainStats PureNet::train_step(
     reduce(val_fc2_.gb, [](const LocalTraining& w) -> const auto& {
         return w.val_fc2.gb;
     });
-     // average losses
-    // average losses
+    // Average losses and gradients over the batch.
     total_loss /= B; total_ploss /= B; total_vloss /= B; total_entropy /= B;
 
-    // average gradients
     float invB = 1.0f / B;
     auto scale = [invB](std::vector<float>& g) {
         for (auto& v : g) v *= invB;
@@ -1137,7 +1130,7 @@ PureNet::TrainStats PureNet::train_step(
     scale(act_fc_.gw); scale(act_fc_.gb); scale(val_c_.gw); scale(val_c_.gb);
     scale(val_fc1_.gw); scale(val_fc1_.gb); scale(val_fc2_.gw); scale(val_fc2_.gb);
 
-    // collect all (param, grad) pairs into Adam (registered once)
+    // Adam keeps pointers to these buffers.
     if (!adam_registered_) {
         register_all_params();
         adam_registered_ = true;

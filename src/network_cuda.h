@@ -6,8 +6,7 @@
 
 namespace gomoku {
 
-// Torch types are hidden behind Impl so the rest of the project does not need
-// to parse the large LibTorch headers.
+// LibTorch stays out of public headers through this pimpl.
 class CudaNetworkBackend {
 public:
     CudaNetworkBackend(PureNet& owner, double learning_rate);

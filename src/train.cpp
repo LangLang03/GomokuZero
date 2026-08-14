@@ -128,7 +128,7 @@ void Trainer::policy_update() {
         stats = net_.train_step(s_buf, batch_size_, p_buf, z_buf, lr);
     }
 
-    // KL-approx adaptive LR from loss delta across policy updates
+    // Approximate KL by the change in loss.
     static float prev_loss = 0;
     float kl = prev_loss > 0 ? std::abs(stats.loss - prev_loss) : 0.05f;
     prev_loss = stats.loss;

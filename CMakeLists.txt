@@ -36,9 +36,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# The lock-free MCTS and CPU fallback are hand-written C++. When the installed
-# Python PyTorch wheel exposes libtorch_cuda, CUDA inference/training is linked
-# automatically; -DGOMOK_ENABLE_CUDA=OFF keeps a dependency-free CPU build.
+# Use LibTorch from the Python wheel when CUDA is available.
 
 add_executable(gomoku_train
     src/main.cpp
@@ -53,8 +51,7 @@ add_executable(gomoku_train
 target_include_directories(gomoku_train PRIVATE src)
 target_link_libraries(gomoku_train PRIVATE pthread)
 if(Torch_FOUND)
-    # LibTorch's template-heavy headers can produce multi-gigabyte temporary
-    # assembly under -O3/LTO while this translation unit only dispatches ops.
+    # LTO on this LibTorch translation unit can exhaust memory.
     set_source_files_properties(src/network_cuda.cpp PROPERTIES
         COMPILE_OPTIONS "-O1;-fno-lto")
     target_sources(gomoku_train PRIVATE src/network_cuda.cpp)

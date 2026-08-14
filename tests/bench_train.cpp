@@ -1,5 +1,4 @@
-// Benchmark one training step (batch 512) on CPU or CUDA backend, x5 epochs,
-// mirroring Trainer::train_batch's loop (train.cpp).
+// Five batch-512 training steps.
 // Usage: bench_train <weights-dir> [inference-threads]
 #include "network.h"
 #include <chrono>
@@ -24,7 +23,7 @@ int main(int argc, char** argv) {
     for (float& p : probs) p = 1.0f / 225.0f;
     for (int i = 0; i < B; ++i) winners[i] = (rng() & 1) ? 1.0f : -1.0f;
 
-    net.train_step(states, B, probs, winners, 2e-3);  // warmup
+    net.train_step(states, B, probs, winners, 2e-3);
     auto t0 = std::chrono::steady_clock::now();
     PureNet::TrainStats s{};
     for (int e = 0; e < 5; ++e) s = net.train_step(states, B, probs, winners, 2e-3);

@@ -1,5 +1,4 @@
-// Numeric gradient check: hand-written backward passes (gradient.cpp)
-// compared against central finite differences on small random layers.
+// Compares native backward kernels with central finite differences.
 #include "gradient.h"
 #include <cmath>
 #include <cstdio>
@@ -23,7 +22,7 @@ constexpr float EPS = 1e-2f;
 template <typename L, typename Fwd, typename Bwd>
 void check_layer_grads(const char* name, L& l, const std::vector<float>& in,
                        Fwd fwd, Bwd bwd) {
-    // loss = sum(out); upstream gradient is all ones
+    // loss = sum(out)
     std::vector<float> out;
     fwd(l, in, out);
     std::vector<float> grad_out(out.size(), 1.0f);
@@ -34,7 +33,7 @@ void check_layer_grads(const char* name, L& l, const std::vector<float>& in,
     bwd(l, in, grad_out, grad_in);
 
     auto loss_at = [&](const std::vector<float>& w, const std::vector<float>& b) {
-        L copy = l;   // ConvLayer/FCLayer are copyable plain structs
+        L copy = l;
         copy.w = w;
         copy.b = b;
         std::vector<float> o;
@@ -68,7 +67,7 @@ void check_layer_grads(const char* name, L& l, const std::vector<float>& in,
             ++fails;
         }
     }
-    // input gradient: perturb a few input cells
+    // Sample input coordinates to keep the test short.
     std::mt19937 rng(7);
     std::uniform_int_distribution<size_t> pick(0, in.size() - 1);
     for (int k = 0; k < 8; ++k) {
@@ -152,7 +151,7 @@ int main() {
                           });
     }
     {
-        // relu: grad = upstream * (y > 0)
+        // ReLU mask.
         std::vector<float> y = {-1.0f, 0.5f, 0.0f, 2.0f, -3.0f};
         std::vector<float> g = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
         relu_backward(y, g);

@@ -74,7 +74,7 @@ std::vector<int> Board::occupied_cells() const {
     return occ;
 }
 
-// directions: horizontal, vertical, diag \, diag /
+// Horizontal, vertical and both diagonals.
 static const int DR[4] = {0, 1, 1, 1};
 static const int DC[4] = {1, 0, 1, -1};
 
@@ -104,8 +104,7 @@ int Board::compute_winner_from_last() const {
 }
 
 void Board::encode_state(float* out) const {
-    // channels: [0]=current player stones, [1]=opponent stones,
-    //           [2]=last move, [3]=all ones if current player is black
+    // current stones, opponent stones, last move, black-to-move
     std::memset(out, 0, 4 * BOARD_CELLS * sizeof(float));
     int opp = (current_ == 1) ? 2 : 1;
     for (int ply = 0; ply < move_count_; ++ply) {

@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
 
     std::vector<float> direct_policy(BOARD_CELLS);
     float direct_value = 0.0f;
-    // forward_batch_policy returns probabilities directly; must match exp(logp)
+    // Probability and log-probability APIs must agree.
     net.forward_batch_policy(state.data(), 1, direct_policy.data(), &direct_value);
     for (int i = 0; i < BOARD_CELLS; ++i) {
         if (std::abs(direct_policy[i] - std::exp(log_policy[i])) > 2e-4f)
@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     if (std::abs(direct_value - value) > 2e-4f)
         return fail("probability path value");
 
-    // quantized inference consistency (falls back to fp32 without AVX-VNNI)
+    // INT8 stays close to FP32.
     net.set_quantized_inference(true);
     std::vector<float> q_policy;
     float q_value = 0.0f;
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     if (max_policy_error > 0.2f || std::abs(q_value - value) > 0.05f)
         return fail("quantized inference consistency");
 
-    // save/load roundtrip: identical forward outputs
+    // Save/load round trip.
     std::filesystem::create_directories(argv[1]);
     if (!net.save(argv[1])) return fail("save");
     PureNet net2(2e-3);
@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
     if (max_policy_error > 2e-4f || std::abs(value2 - value) > 2e-4f)
         return fail("save/load roundtrip");
 
-    // self-play roundtrip: a small batch of games completes and yields samples
+    // A small self-play batch must produce normalized targets.
     net2.set_quantized_inference(false);
     BatchedSelfPlay sp(net2, 5.0f, 50, 2, 1);
     auto samples = sp.run_batch(1.0f);

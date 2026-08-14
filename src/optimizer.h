@@ -5,12 +5,7 @@
 
 namespace gomoku {
 
-// Hand-written Adam optimizer (matches torch::optim::Adam semantics:
-//   m = beta1*m + (1-beta1)*g
-//   v = beta2*v + (1-beta2)*g^2
-//   w -= lr * m_hat / (sqrt(v_hat) + eps)
-// with l2 weight decay added to the gradient (weight_decay).
-// Also implements gradient clipping (clip_grad_norm_ equivalent).
+// Adam with L2 weight decay and global gradient clipping.
 class Adam {
 public:
     Adam(double lr, double beta1 = 0.9, double beta2 = 0.999,
@@ -18,7 +13,7 @@ public:
         : lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps),
           weight_decay_(weight_decay) {}
 
-    // register a parameter tensor (returns its index for step())
+    // Parameter and gradient registration order must match.
     size_t add_param(std::vector<float>& param) {
         size_t idx = params_.size();
         params_.push_back(&param);
@@ -33,14 +28,12 @@ public:
         }
     }
 
-    // register a gradient tensor that mirrors a param
     size_t add_grad(std::vector<float>& grad) {
         size_t idx = grads_.size();
         grads_.push_back(&grad);
         return idx;
     }
 
-    // clip total gradient norm to max_norm (in-place scaling)
     void clip_grad_norm(float max_norm) {
         float sum_sq = 0.0f;
         for (auto* g : grads_) {
@@ -55,7 +48,6 @@ public:
         }
     }
 
-    // apply one Adam step for all params (assumes grads_ filled)
     void step() {
         ++step_;
         const float bias1 = 1.0f - std::pow(static_cast<float>(beta1_), step_);

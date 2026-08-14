@@ -8,8 +8,7 @@ namespace gomoku {
 AsyncLogger logger;
 
 void AsyncLogger::log(const char* fmt, ...) {
-    // synchronous write: training logs are low-frequency (a few per batch)
-    // and must survive crashes; async buffering loses them on SIGSEGV
+    // Keep progress visible if training crashes.
     char buf[1024];
     va_list args;
     va_start(args, fmt);

@@ -9,9 +9,7 @@
 
 namespace gomoku {
 
-// Non-blocking async logger: log() enqueues a formatted line and returns
-// immediately; a background thread flushes the queue to stdout. Formatting
-// matches the Python trainer output so logs are familiar ([PROGRESS], kl:...).
+// Training logger. log() flushes completed lines immediately.
 class AsyncLogger {
 public:
     AsyncLogger() { worker_ = std::thread(&AsyncLogger::run, this); }
@@ -22,7 +20,7 @@ public:
         flush();
     }
 
-    // printf-style, non-blocking
+    // printf-style
     void log(const char* fmt, ...);
 
 private:

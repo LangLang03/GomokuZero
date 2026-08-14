@@ -1,6 +1,4 @@
-// Benchmark the SAME Gomoku net via libtorch on CPU vs CUDA.
-// The .pt is a weight-only TorchScript module, so we rebuild the net with
-// torch::nn and copy the state_dict over, then time forwards.
+// LibTorch CPU/CUDA forward benchmark.
 // Usage: bench_torch <model.pt> <B> [iters]
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -72,9 +70,9 @@ int main(int argc, char** argv) {
     if (argc != 3) { std::fprintf(stderr, "usage: bench_torch <model.pt> <B>\n"); return 2; }
     const int B = std::atoi(argv[2]);
     torch::jit::Module w = torch::jit::load(argv[1]);
-    w.to(torch::kCPU);  // the archive may store tensors on CUDA; force CPU
+    w.to(torch::kCPU);
     GomokuNet net;
-    // copy weights by full name (e.g. "conv1.weight") from the jit module
+    // Match parameters by their full module name.
     std::map<std::string, torch::Tensor> src;
     for (auto it : w.named_parameters()) src[it.name] = it.value;
     for (auto& it : net.named_parameters()) {

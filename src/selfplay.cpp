@@ -35,9 +35,7 @@ enum NodeState : uint8_t {
     NODE_EXPANDED = 2,
 };
 
-// Children occupy [child_begin, child_begin + child_count). Immutable fields
-// are published by the release-store to state. The frequently updated fields
-// occupy one cache line and use lock-free atomics.
+// state publishes the immutable child range. Search counters are atomic.
 struct alignas(32) GNode {
     std::atomic<int64_t> value_sum{0};
     std::atomic<int32_t> visits{0};
@@ -346,8 +344,7 @@ BatchedSelfPlay::BatchedSelfPlay(PureNet& net, float c_puct,
         n_threads = hardware_threads == 0 ? 1
             : std::min(8, static_cast<int>(hardware_threads));
     }
-    // CUDA owns network parallelism. Keep only the coordinator on CPU and
-    // leave the physical cores available to lock-free tree workers.
+    // CUDA needs one inference coordinator; CPU inference uses its worker pool.
     inference_threads_ = net_.using_cuda()
         ? 1 : std::max(1, std::min(n_threads, 32));
     net_.set_inference_threads(inference_threads_);
@@ -357,10 +354,7 @@ BatchedSelfPlay::BatchedSelfPlay(PureNet& net, float c_puct,
         leaf_batch_size_ = std::max(
             1, std::min(n_playout_, std::atoi(leaf_batch_text)));
     } else if (net_.using_cuda()) {
-        // This small 15x15 network is throughput-optimal around a total CUDA
-        // batch of 128 on current GPUs. Larger batches reduce kernel
-        // efficiency and also hold completed leaves away from the tree for
-        // longer. Convert that total target to the existing per-game limit.
+        // The 15x15 CUDA network peaks near a total batch of 128.
         constexpr int CUDA_TARGET_BATCH = 128;
         leaf_batch_size_ = std::max(1, std::min(
             n_playout_,
@@ -421,9 +415,7 @@ BatchedSelfPlay::run_batch(float temp) {
     const int batch_wait_us = wait_text != nullptr
         ? std::max(0, std::atoi(wait_text)) : 100;
 
-    // These buffers are intentionally retained for the whole self-play batch.
-    // Reconstructing tens of megabytes of Board/Path storage at every move was
-    // measurable once inference and tree updates began to overlap.
+    // Reuse the queues and inference buffers across moves.
     const int max_target = batch * n_playout_;
     const int max_inference_capacity = std::max(
         1, std::min(max_target, batch * leaf_batch_size_));
@@ -674,8 +666,7 @@ BatchedSelfPlay::run_batch(float temp) {
                                       std::memory_order_release);
             }
 
-            // Cache replacement happens only after every task in this batch
-            // has consumed its result, so cached references remain stable.
+            // Do not evict entries until this batch has copied its results.
             for (const auto& entry : pending_evaluations) {
                 const uint64_t key = entry.first;
                 const CachedEvaluation& result =

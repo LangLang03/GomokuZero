@@ -1,5 +1,4 @@
-// Cross-check harness: dump PureNet (hand-written AVX2) forward output for a
-// fixed state so Python can compare it against the ONNX export.
+// Dumps a fixed forward pass for ONNX comparison.
 #include "network.h"
 #include <cstdio>
 #include <cstdlib>
@@ -14,15 +13,14 @@ static void write_float_file(const char* path, const float* data, size_t n) {
 }
 
 static void make_state(std::vector<float>& state) {
-    // Deterministic mid-game position (mirrors export_onnx.py's test layout):
-    // ch0 own stones, ch1 opponent stones, ch2 last move, ch3 player marker.
+    // Same channel layout as export_onnx.py.
     state.assign(4 * 225, 0.0f);
     int own[] = {7, 112, 38, 157, 83, 166, 19, 130, 55, 144};
     int opp[] = {8, 113, 39, 156, 84, 165, 20, 131, 56, 143};
     for (int i : own) state[0 * 225 + i] = 1.0f;
     for (int i : opp) state[1 * 225 + i] = 1.0f;
     state[2 * 225 + 144] = 1.0f;  // last move
-    for (int i = 0; i < 225; ++i) state[3 * 225 + i] = 1.0f;  // player 1 to move
+    for (int i = 0; i < 225; ++i) state[3 * 225 + i] = 1.0f;  // black to move
 }
 
 int main(int argc, char** argv) {

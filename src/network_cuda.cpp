@@ -76,8 +76,7 @@ struct CudaNetworkBackend::Impl {
             available = torch::cuda::is_available();
             if (!available) return;
             device = torch::Device(torch::kCUDA, 0);
-            // MCTS produces hundreds of different batch dimensions. cuDNN
-            // benchmarking every new shape costs far more than the tiny net.
+            // MCTS batch sizes vary, so cuDNN autotuning is a net loss here.
             at::globalContext().setBenchmarkCuDNN(false);
             at::globalContext().setAllowTF32CuDNN(true);
             at::globalContext().setAllowTF32CuBLAS(true);

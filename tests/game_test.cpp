@@ -1,5 +1,4 @@
-// Board rule unit tests: play/undo, wins in all four directions,
-// no false positives, state encoding.
+// Board rules and state encoding.
 #include "game.h"
 #include <cstdio>
 #include <utility>
@@ -29,7 +28,7 @@ int main() {
         CHECK(board.position_key() == empty_key,
               "position key roundtrip after undo");
     }
-    {   // basic state
+    {
         Board b;
         CHECK(b.move_count() == 0, "fresh board move count");
         CHECK(b.current_player() == 1, "black starts");
@@ -39,7 +38,7 @@ int main() {
         CHECK(b.legal_moves().size() == BOARD_CELLS, "all moves legal");
     }
 
-    {   // alternating players, undo
+    {
         Board b;
         play(b, 7, 7);
         CHECK(b.current_player() == 2, "white after black");
@@ -53,21 +52,21 @@ int main() {
         CHECK(b.move_count() == 0 && b.last_move() == -1, "undo all");
     }
 
-    {   // horizontal win for black
+    {   // Horizontal.
         Board b;
         for (int c = 0; c < 4; ++c) {
             play(b, 7, c);
-            play(b, 14, c);   // white elsewhere
+            play(b, 14, c);
         }
         play(b, 7, 4);
         CHECK(b.winner() == 1, "horizontal win");
         CHECK(b.game_over(), "game over on win");
     }
 
-    {   // vertical win for white
+    {   // Vertical.
         Board b;
         for (int r = 1; r <= 4; ++r) {
-            play(b, 0, r - 1);   // black elsewhere
+            play(b, 0, r - 1);
             play(b, r, 7);
         }
         play(b, 0, 4);
@@ -75,7 +74,7 @@ int main() {
         CHECK(b.winner() == 2, "vertical win");
     }
 
-    {   // diagonal \ win
+    {   // Main diagonal.
         Board b;
         for (int i = 0; i < 4; ++i) {
             play(b, i, i);
@@ -85,7 +84,7 @@ int main() {
         CHECK(b.winner() == 1, "diag backslash win");
     }
 
-    {   // diagonal / win
+    {   // Anti-diagonal.
         Board b;
         for (int i = 0; i < 4; ++i) {
             play(b, i, 4 - i);
@@ -95,7 +94,7 @@ int main() {
         CHECK(b.winner() == 1, "diag slash win");
     }
 
-    {   // four in a row is not a win
+    {
         Board b;
         for (int c = 0; c < 4; ++c) {
             play(b, 7, c);
@@ -104,7 +103,7 @@ int main() {
         CHECK(b.winner() == 0, "four in a row not a win");
     }
 
-    {   // undo after a win clears it
+    {
         Board b;
         for (int c = 0; c < 4; ++c) {
             play(b, 7, c);
@@ -117,7 +116,7 @@ int main() {
         CHECK(b.move_count() == 8, "undo keeps count");
     }
 
-    {   // state encoding: black(7,7), white(7,8), last move white, black to move
+    {   // Black to move after white at (7,8).
         Board b;
         play(b, 7, 7);
         play(b, 7, 8);
@@ -133,7 +132,7 @@ int main() {
               "no cross-channel leakage");
     }
 
-    {   // state encoding flips with the player: after white moves, white is current
+    {   // Channel ownership follows the side to move.
         Board b;
         play(b, 7, 7);
         play(b, 7, 8);

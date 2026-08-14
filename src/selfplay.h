@@ -5,8 +5,7 @@
 
 namespace gomoku {
 
-// Lock-free MCTS over a batch of independent games. Search workers claim and
-// update tree nodes concurrently; one coordinator combines inference requests.
+// Batched lock-free MCTS with one inference coordinator.
 class BatchedSelfPlay {
 public:
     struct Sample {
@@ -16,14 +15,14 @@ public:
     };
 
     BatchedSelfPlay(PureNet& net, float c_puct, int n_playout,
-                    int batch_games, int n_threads = -1);  // inference workers
+                    int batch_games, int n_threads = -1);
     ~BatchedSelfPlay() = default;
 
-    // play one batch of games to completion, returns samples per game
+    // Returns one sample sequence per game.
     std::vector<std::vector<Sample>> run_batch(float temp);
 
 private:
-    PureNet& net_;             // used for self-play inference + training
+    PureNet& net_;
     float c_puct_;
     int n_playout_;
     int batch_games_;

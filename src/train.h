@@ -6,9 +6,7 @@
 
 namespace gomoku {
 
-// Training pipeline: batched self-play -> experience buffer ->
-// mixed training (self-play + optional game-record data) -> eval -> save.
-// Pure C++: mix data loaded from raw .bin files, no torch anywhere.
+// Batched self-play and policy updates.
 class Trainer {
 public:
     Trainer(PureNet& net, int n_playout, int batch_games,
@@ -26,9 +24,9 @@ private:
     float c_puct_, temp_;
     std::string mix_data_;
     float mix_ratio_;
-    std::string tag_;  // checkpoint file prefix, isolates parallel runs
+    std::string tag_;  // checkpoint suffix
 
-    // experience buffer (state, probs, z)
+    // Replay entry.
     struct Exp {
         std::vector<float> state;   // 4*15*15
         std::vector<float> probs;   // 225
@@ -37,7 +35,7 @@ private:
     std::vector<Exp> buffer_;
     int buf_head_ = 0;
 
-    // game-record dataset (raw float32 bins: <prefix>_states/probs/winners.bin)
+    // Optional float32 training and validation data.
     std::vector<float> mix_states_, mix_probs_, mix_winners_;
     int64_t n_mix_ = 0;
     std::vector<float> val_states_, val_probs_, val_winners_;
