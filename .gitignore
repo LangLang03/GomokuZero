@@ -17,11 +17,15 @@ best_policy_*_bin/
 best_policy_*.pt
 mix_data*
 
-# Raw renju-net source (keep the processed .npz)
-renjunet.xml
+# Raw renju-net data + processed npz (large, regenerable)
+data/renjunet.xml
+data/renjunet.xml.gz
+data/renjunet_classic.npz
 
 # Logs
 *.log
+
+.omo/
 
 # Editors / OS
 .vscode/
