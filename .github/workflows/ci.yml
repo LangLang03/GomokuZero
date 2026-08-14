@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    name: Build & test (pure C++, no CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DGOMOK_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+        working-directory: cpp
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+        working-directory: cpp
+
+      - name: Unit tests (ctest)
+        run: ctest --test-dir build --output-on-failure
+        working-directory: cpp
+
+      - name: End-to-end train smoke (1 batch, from scratch)
+        run: ./build/gomoku_train train --games 1 --playout 50 --batch-games 2 --check-freq 1 --threads 2 --cpu --tag ci
+        working-directory: cpp/build
+        timeout-minutes: 5
+
+      - name: Self-play smoke against freshly trained model
+        run: ./build/gomoku_train selfplay --model best_policy_ci_bin --playout 100 --games 2 --batch 2 --threads 2 --cpu
+        working-directory: cpp/build
+        timeout-minutes: 5
+
+      - name: Python play UI compile check
+        run: python3 -m py_compile cpp/ui/server.py cpp/ui/human_play.py cpp/ui/game.py cpp/ui/mcts_alphaZero.py cpp/ui/mcts_pure.py cpp/ui/policy_value_net_pytorch.py cpp/ui/policy_value_net_numpy.py cpp/ui/tactical.py

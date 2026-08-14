@@ -1,0 +1,29 @@
+# Build
+build/
+build_cuda/
+build-trace/
+
+# Python
+__pycache__/
+*.pyc
+
+# Machine-specific torch location
+torch_dir.txt
+
+# Training checkpoints and data (large, keep local)
+*_ckpt*/
+cpp_model*/
+best_policy_*_bin/
+best_policy_*.pt
+mix_data*
+
+# Raw renju-net source (keep the processed .npz)
+renjunet.xml
+
+# Logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
