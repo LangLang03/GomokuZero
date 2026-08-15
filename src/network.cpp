@@ -804,8 +804,8 @@ void PureNet::forward_impl(const float* state, float* policy,
         fast_fc(val_fc2_, ws.vh, ws.vlogit, false);
 #endif
     } else {
-        conv1x1_forward(val_c_, ws.c3, ws.va); relu_forward(ws.va);
-        fc_forward(val_fc1_, ws.va, ws.vh); relu_forward(ws.vh);
+        conv1x1_forward(val_c_, ws.c3, ws.va); leaky_relu_forward(ws.va);
+        fc_forward(val_fc1_, ws.va, ws.vh); leaky_relu_forward(ws.vh);
         fc_forward(val_fc2_, ws.vh, ws.vlogit);
     }
     value = std::tanh(ws.vlogit[0]);
@@ -993,9 +993,9 @@ PureNet::TrainStats PureNet::train_step(
             }
 
             conv1x1_forward(work.val_c, work.c3_out, work.va);
-            relu_forward(work.va);
+            leaky_relu_forward(work.va);
             fc_forward(work.val_fc1, work.va, work.vh);
-            relu_forward(work.vh);
+            leaky_relu_forward(work.vh);
             fc_forward(work.val_fc2, work.vh, work.vlogit);
             const float value = std::tanh(work.vlogit[0]);
             const float value_loss =
@@ -1013,9 +1013,9 @@ PureNet::TrainStats PureNet::train_step(
                 2.0f * static_cast<float>(value_loss_weight) *
                 (value - target_value) * (1.0f - value * value)};
             fc_backward(work.val_fc2, work.vh, value_gradient, work.g_vh);
-            relu_backward(work.vh, work.g_vh);
+            leaky_relu_backward(work.vh, work.g_vh);
             fc_backward(work.val_fc1, work.va, work.g_vh, work.g_va);
-            relu_backward(work.va, work.g_va);
+            leaky_relu_backward(work.va, work.g_va);
             conv1x1_backward(work.val_c, work.c3_out, work.g_va,
                              work.g_c3_value);
 

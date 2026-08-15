@@ -62,4 +62,10 @@ inline void relu_forward(std::vector<float>& x) {
 // y is the post-ReLU activation.
 void relu_backward(const std::vector<float>& y, std::vector<float>& grad);
 
+// Leaky ReLU for the value head to avoid dead neurons.
+void leaky_relu_forward(std::vector<float>& x, float alpha = 0.01f);
+void leaky_relu_backward(const std::vector<float>& y,
+                         std::vector<float>& grad,
+                         float alpha = 0.01f);
+
 }  // namespace gomoku

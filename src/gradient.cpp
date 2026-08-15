@@ -527,4 +527,16 @@ void relu_backward(const std::vector<float>& output,
         if (output[i] <= 0.0f) gradient[i] = 0.0f;
 }
 
+void leaky_relu_forward(std::vector<float>& x, float alpha) {
+    for (auto& v : x)
+        if (v < 0.0f) v *= alpha;
+}
+
+void leaky_relu_backward(const std::vector<float>& y,
+                         std::vector<float>& grad,
+                         float alpha) {
+    for (size_t i = 0; i < grad.size(); ++i)
+        if (y[i] <= 0.0f) grad[i] *= alpha;
+}
+
 }  // namespace gomoku

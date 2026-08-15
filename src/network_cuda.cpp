@@ -40,9 +40,9 @@ public:
         policy = policy.reshape({-1, 4 * 225});
         policy = torch::log_softmax(act_fc1->forward(policy), 1);
 
-        auto value = torch::relu(val_conv1->forward(trunk));
+        auto value = torch::leaky_relu(val_conv1->forward(trunk), 0.01);
         value = value.reshape({-1, 2 * 225});
-        value = torch::relu(val_fc1->forward(value));
+        value = torch::leaky_relu(val_fc1->forward(value), 0.01);
         value = torch::tanh(val_fc2->forward(value));
         return {policy, value};
     }

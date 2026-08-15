@@ -31,8 +31,8 @@ class GomokuNet(nn.Module):
         trunk = F.relu(self.conv3(trunk))
         policy = F.relu(self.act_conv1(trunk)).flatten(1)
         log_policy = F.log_softmax(self.act_fc1(policy), dim=1)
-        value = F.relu(self.val_conv1(trunk)).flatten(1)
-        value = F.relu(self.val_fc1(value))
+        value = F.leaky_relu(self.val_conv1(trunk), 0.01).flatten(1)
+        value = F.leaky_relu(self.val_fc1(value), 0.01)
         return log_policy, torch.tanh(self.val_fc2(value))
 
 
