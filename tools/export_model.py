@@ -33,7 +33,7 @@ def main():
             print('skipping non-tensor:', key)
             continue
         flat = tensor.detach().cpu().numpy().ravel().astype('float32')
-        out = os.path.join(out_dir, key + '.bin')
+        out = os.path.join(out_dir, key.replace('.', '_') + '.bin')
         with open(out, 'wb') as f:
             f.write(struct.pack('<I', flat.size))
             f.write(flat.tobytes())

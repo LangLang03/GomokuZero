@@ -11,7 +11,7 @@ Selection (matches the original pipeline):
 Coordinate mapping: RenjuNet writes moves as "<col-letter><row-digit>"
 e.g. h8 -> col=7, row=7 -> move=7*15+7. State encoding mirrors
 Board.encode_state: channels [current stones, opponent stones, last move,
-all-ones if current player is black], vertically flipped.
+all-ones if current player is black].
 
 Usage: python3 parse_renjunet.py <renjunet.xml> <out.npz> [--limit N]
 """
@@ -158,7 +158,7 @@ def main():
                     sq[2, r, c] = 1.0
             if len(self.states) % 2 == 0:
                 sq[3, :, :] = 1.0
-            return sq[:, ::-1, :]
+            return sq
 
     board = Board()
     states, probs, winners = [], [], []

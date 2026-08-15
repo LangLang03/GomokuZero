@@ -26,12 +26,13 @@ Trainer::Trainer(PureNet& net, int n_playout, int batch_games,
                  int n_threads, float c_puct, float temp, int buffer_size,
                  int batch_size, int epochs, int check_freq, int game_batch_num,
                  const std::string& mix_data, float mix_ratio,
-                 const std::string& tag)
+                 const std::string& tag,
+                 double lr_multiplier_init)
     : net_(net), n_playout_(n_playout), batch_games_(batch_games),
       n_threads_(n_threads), buffer_size_(buffer_size), batch_size_(batch_size),
       epochs_(epochs), check_freq_(check_freq), game_batch_num_(game_batch_num),
       c_puct_(c_puct), temp_(temp), mix_data_(mix_data), mix_ratio_(mix_ratio),
-      tag_(tag) {
+      tag_(tag), lr_multiplier_(lr_multiplier_init) {
     buffer_.reserve(buffer_size_);
     load_mix_data();
 }
@@ -128,17 +129,24 @@ void Trainer::policy_update() {
         stats = net_.train_step(s_buf, batch_size_, p_buf, z_buf, lr);
     }
 
-    // Approximate KL by the change in loss.
+    // Approximate KL by the change in loss, smoothed to reduce noise.
     static float prev_loss = 0;
-    float kl = prev_loss > 0 ? std::abs(stats.loss - prev_loss) : 0.05f;
+    static float smoothed_kl = 0.05f;
+    const float raw_kl = prev_loss > 0 ? std::abs(stats.loss - prev_loss) : 0.05f;
+    smoothed_kl = 0.7f * smoothed_kl + 0.3f * raw_kl;
+    const float kl = smoothed_kl;
     prev_loss = stats.loss;
     if (kl > kl_targ_ * 4) {
         lr_multiplier_ /= 1.5;
     } else if (kl > kl_targ_ * 2 && lr_multiplier_ > 0.1) {
         lr_multiplier_ /= 1.5;
-    } else if (kl < kl_targ_ / 2 && lr_multiplier_ < 10) {
+    } else if (kl < kl_targ_ / 2 && lr_multiplier_ < 2.0) {
         lr_multiplier_ *= 1.5;
     }
+
+    // Avoid total LR collapse: keep a small minimum learning rate.
+    if (lr_multiplier_ < 0.01) lr_multiplier_ = 0.01;
+    if (lr_multiplier_ > 2.0) lr_multiplier_ = 2.0;
 
     logger.log("kl:%.5f,lr_multiplier:%.3f,loss:%.6f,entropy:%.6f",
                kl, lr_multiplier_, stats.loss, stats.entropy);

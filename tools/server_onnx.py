@@ -158,7 +158,7 @@ class Board:
                 square[2, self.last_move // BOARD, self.last_move % BOARD] = 1.0
         if len(self.states) % 2 == 0:
             square[3, :, :] = 1.0
-        return square[:, ::-1, :]
+        return square
 
     def winner(self):
         if self.last_move < 0:
@@ -194,6 +194,23 @@ class Board:
         if not self.availables:
             return True, -1
         return False, -1
+
+
+def nearby_moves(board, radius=2, max_cand=40):
+    """Return legal moves near existing stones (mirrors C++ MCTS pruning)."""
+    candidates = set()
+    for mv in board.states:
+        r, c = divmod(mv, BOARD)
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < BOARD and 0 <= nc < BOARD:
+                    idx = nr * BOARD + nc
+                    if idx in board.availables:
+                        candidates.add(idx)
+    if not candidates:
+        candidates.update(board.availables)
+    return candidates
 
 
 class MCTSNode:
@@ -246,7 +263,10 @@ class MCTS:
             else:
                 leaf_value = 1.0 if winner == state.current_player else -1.0
         else:
-            node.expand(action_probs)
+            candidates = nearby_moves(state)
+            filtered = [(a, p) for a, p in action_probs if a in candidates]
+            filtered.sort(key=lambda x: x[1], reverse=True)
+            node.expand(filtered[:40] if filtered else action_probs)
         node.update_recursive(-leaf_value)
 
     def get_move(self, board, temp=1e-3):

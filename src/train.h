@@ -13,7 +13,8 @@ public:
             int n_threads, float c_puct, float temp, int buffer_size,
             int batch_size, int epochs, int check_freq, int game_batch_num,
             const std::string& mix_data, float mix_ratio,
-            const std::string& tag = "cpp");
+            const std::string& tag = "cpp",
+            double lr_multiplier_init = 1.0);
 
     void run();
 
@@ -42,7 +43,7 @@ private:
     int64_t n_val_ = 0;
 
     double lr_multiplier_ = 1.0;
-    const double kl_targ_ = 0.02;
+    const double kl_targ_ = 0.05;
 
     void load_mix_data();
     void add_samples(const std::vector<std::vector<BatchedSelfPlay::Sample>>& batches);
