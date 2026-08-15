@@ -46,14 +46,57 @@ def load_state(path: Path):
         return state
 
 
+def load_state_from_bin(directory: Path):
+    """Load weights from raw .bin files (C++ trainer's native format).
+
+    Each file: [uint32 count][float32 values...], named <layer>_weight.bin /
+    <layer>_bias.bin, matching tools/export_model.py output.
+    """
+    import struct
+
+    layer_shapes = {
+        "conv1": ((32, 4, 3, 3), (32,)),
+        "conv2": ((64, 32, 3, 3), (64,)),
+        "conv3": ((128, 64, 3, 3), (128,)),
+        "act_conv1": ((4, 128, 1, 1), (4,)),
+        "act_fc1": ((225, 900), (225,)),
+        "val_conv1": ((2, 128, 1, 1), (2,)),
+        "val_fc1": ((64, 450), (64,)),
+        "val_fc2": ((1, 64), (1,)),
+    }
+
+    def read_bin(name: str, shape):
+        path = directory / name
+        with open(path, "rb") as f:
+            (count,) = struct.unpack("<I", f.read(4))
+            data = np.frombuffer(f.read(), dtype="<f4")
+            assert len(data) == count, f"{name}: count {count} != data {len(data)}"
+        return torch.from_numpy(data.reshape(shape))
+
+    state = {}
+    for layer, (w_shape, b_shape) in layer_shapes.items():
+        state[f"{layer}.weight"] = read_bin(f"{layer}_weight.bin", w_shape)
+        state[f"{layer}.bias"] = read_bin(f"{layer}_bias.bin", b_shape)
+    return state
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=None,
+        help="load weights from a directory of raw .bin files instead of source",
+    )
     args = parser.parse_args()
 
     model = GomokuNet().eval()
-    model.load_state_dict(load_state(args.source), strict=True)
+    if args.bin_dir is not None:
+        model.load_state_dict(load_state_from_bin(args.bin_dir), strict=True)
+    else:
+        model.load_state_dict(load_state(args.source), strict=True)
     example = torch.zeros(1, 4, 15, 15, dtype=torch.float32)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -75,9 +118,14 @@ def main() -> None:
 
     exported = onnx.load(args.output)
     onnx.checker.check_model(exported)
+    source_sha = (
+        hashlib.sha256(b"".join(p.read_bytes() for p in sorted(args.bin_dir.glob("*.bin")))).hexdigest()
+        if args.bin_dir is not None
+        else hashlib.sha256(args.source.read_bytes()).hexdigest()
+    )
     metadata = {
-        "source": str(args.source),
-        "source_sha256": hashlib.sha256(args.source.read_bytes()).hexdigest(),
+        "source": str(args.bin_dir if args.bin_dir is not None else args.source),
+        "source_sha256": source_sha,
         "board_size": "15x15",
         "policy_output": "log_softmax",
     }
