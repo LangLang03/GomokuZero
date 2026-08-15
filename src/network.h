@@ -33,7 +33,8 @@ public:
     TrainStats train_step(const std::vector<float>& states, int B,
                           const std::vector<float>& probs,
                           const std::vector<float>& winners,
-                          double lr);
+                          double lr,
+                          double value_loss_weight = 1.0);
 
     // [4][15][15] -> log_policy[225], value
     void forward_one(const std::vector<float>& state,

@@ -216,7 +216,7 @@ void CudaNetworkBackend::forward(const float* states, int batch,
 PureNet::TrainStats CudaNetworkBackend::train_step(
     const std::vector<float>& states, int batch,
     const std::vector<float>& probs, const std::vector<float>& winners,
-    double learning_rate) {
+    double learning_rate, double value_loss_weight) {
     impl_->net->train();
     for (auto& group : impl_->optimizer->param_groups()) {
         static_cast<torch::optim::AdamOptions&>(group.options())
@@ -239,7 +239,7 @@ PureNet::TrainStats CudaNetworkBackend::train_step(
                                             value_target);
     const auto policy_loss = -torch::mean(torch::sum(
         policy_target * log_policy, 1));
-    const auto loss = value_loss + policy_loss;
+    const auto loss = value_loss * value_loss_weight + policy_loss;
     loss.backward();
     torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), 10.0);
     impl_->optimizer->step();

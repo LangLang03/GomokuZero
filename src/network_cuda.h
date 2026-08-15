@@ -22,7 +22,8 @@ public:
     PureNet::TrainStats train_step(const std::vector<float>& states, int batch,
                                    const std::vector<float>& probs,
                                    const std::vector<float>& winners,
-                                   double learning_rate);
+                                   double learning_rate,
+                                   double value_loss_weight = 1.0);
 
 private:
     struct Impl;

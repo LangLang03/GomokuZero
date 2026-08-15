@@ -886,14 +886,15 @@ void PureNet::set_cuda_enabled(bool enabled) {
 PureNet::TrainStats PureNet::train_step(
     const std::vector<float>& states, int B,
     const std::vector<float>& probs, const std::vector<float>& winners,
-    double lr) {
+    double lr, double value_loss_weight) {
     const int HW = 225;
     if (B <= 0 || states.size() != static_cast<size_t>(B) * 4 * HW ||
         probs.size() != static_cast<size_t>(B) * HW ||
         winners.size() != static_cast<size_t>(B))
         throw std::invalid_argument("invalid training batch dimensions");
     if (cuda_enabled_)
-        return cuda_backend_->train_step(states, B, probs, winners, lr);
+        return cuda_backend_->train_step(states, B, probs, winners, lr,
+                                         value_loss_weight);
     // Workers accumulate private gradients, reduced after the batch.
     adam_.set_lr(lr);
     // Clear destination gradients before reduction.
@@ -999,7 +1000,7 @@ PureNet::TrainStats PureNet::train_step(
             const float value = std::tanh(work.vlogit[0]);
             const float value_loss =
                 (value - target_value) * (value - target_value);
-            work.loss += policy_loss + value_loss;
+            work.loss += policy_loss + value_loss * static_cast<float>(value_loss_weight);
             work.policy_loss += policy_loss;
             work.value_loss += value_loss;
 
@@ -1009,7 +1010,8 @@ PureNet::TrainStats PureNet::train_step(
             work.entropy += entropy;
 
             const std::vector<float> value_gradient{
-                2.0f * (value - target_value) * (1.0f - value * value)};
+                2.0f * static_cast<float>(value_loss_weight) *
+                (value - target_value) * (1.0f - value * value)};
             fc_backward(work.val_fc2, work.vh, value_gradient, work.g_vh);
             relu_backward(work.vh, work.g_vh);
             fc_backward(work.val_fc1, work.va, work.g_vh, work.g_va);

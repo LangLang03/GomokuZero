@@ -17,7 +17,7 @@ void CudaNetworkBackend::forward(const float*, int, float*, float*, bool) const 
 }
 PureNet::TrainStats CudaNetworkBackend::train_step(
     const std::vector<float>&, int, const std::vector<float>&,
-    const std::vector<float>&, double) {
+    const std::vector<float>&, double, double) {
     throw std::logic_error("CUDA backend is unavailable");
 }
 

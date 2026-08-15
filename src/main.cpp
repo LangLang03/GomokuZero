@@ -17,7 +17,7 @@ static void print_usage() {
         "  train  --init <bin_dir> --games N --playout N --batch-games N\n"
         "         [--mix <prefix>] [--mix-ratio 0.5] [--check-freq 50]\n"
         "         [--threads N] [--int8] [--cpu] [--tag name]\n"
-        "         [--lr-multiplier 1.0]\n"
+        "         [--lr-multiplier 1.0] [--value-loss-weight 1.0]\n"
         "  selfplay --model <bin_dir> --playout N --games N [--batch N]\n"
         "         [--threads N] [--int8] [--cpu] (CUDA is automatic)\n"
         "         (benchmark self-play throughput)\n"
@@ -33,6 +33,7 @@ int cmd_train(int argc, char** argv) {
     bool force_cpu = false;
     float mix_ratio = 0.5f;
     double lr_multiplier_init = 1.0;
+    double value_loss_weight = 1.0;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -48,6 +49,7 @@ int cmd_train(int argc, char** argv) {
         else if (a == "--check-freq") { if (i+1<argc) check_freq = std::stoi(argv[++i]); }
         else if (a == "--mix-ratio") { if (i+1<argc) mix_ratio = std::stof(argv[++i]); }
         else if (a == "--lr-multiplier") { if (i+1<argc) lr_multiplier_init = std::stod(argv[++i]); }
+        else if (a == "--value-loss-weight") { if (i+1<argc) value_loss_weight = std::stod(argv[++i]); }
         else if (a == "--threads") { if (i+1<argc) n_threads = std::stoi(argv[++i]); }
         else if (a == "--int8") { int8_inference = true; }
         else if (a == "--cpu") { force_cpu = true; }
@@ -63,7 +65,8 @@ int cmd_train(int argc, char** argv) {
         std::cerr << "[net] --int8 is CPU-only; CUDA uses FP32/TF32\n";
     Trainer trainer(net, playout, batch_games, n_threads, 5.0f, 1.0f,
                     buffer, batch_size, epochs, check_freq, games,
-                    mix, mix_ratio, tag, lr_multiplier_init);
+                    mix, mix_ratio, tag, lr_multiplier_init,
+                    value_loss_weight);
     trainer.run();
     return 0;
 }

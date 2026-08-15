@@ -27,12 +27,14 @@ Trainer::Trainer(PureNet& net, int n_playout, int batch_games,
                  int batch_size, int epochs, int check_freq, int game_batch_num,
                  const std::string& mix_data, float mix_ratio,
                  const std::string& tag,
-                 double lr_multiplier_init)
+                 double lr_multiplier_init,
+                 double value_loss_weight)
     : net_(net), n_playout_(n_playout), batch_games_(batch_games),
       n_threads_(n_threads), buffer_size_(buffer_size), batch_size_(batch_size),
       epochs_(epochs), check_freq_(check_freq), game_batch_num_(game_batch_num),
       c_puct_(c_puct), temp_(temp), mix_data_(mix_data), mix_ratio_(mix_ratio),
-      tag_(tag), lr_multiplier_(lr_multiplier_init) {
+      tag_(tag), lr_multiplier_(lr_multiplier_init),
+      value_loss_weight_(value_loss_weight) {
     buffer_.reserve(buffer_size_);
     load_mix_data();
 }
@@ -126,7 +128,8 @@ void Trainer::policy_update() {
     double lr = 2e-3 * lr_multiplier_;
     PureNet::TrainStats stats{};
     for (int e = 0; e < epochs_; ++e) {
-        stats = net_.train_step(s_buf, batch_size_, p_buf, z_buf, lr);
+        stats = net_.train_step(s_buf, batch_size_, p_buf, z_buf, lr,
+                                value_loss_weight_);
     }
 
     // Approximate KL by the change in loss, smoothed to reduce noise.
