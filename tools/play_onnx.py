@@ -101,6 +101,30 @@ def nearby_moves(board, radius=2, max_cand=40):
     return candidates
 
 
+def makes_five(board, move, player):
+    """Return True if placing `player` at `move` would make five in a row."""
+    r, c = divmod(move, BOARD)
+    for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        cnt = 1
+        for s in range(1, N_IN_ROW):
+            rr, cc = r + dr * s, c + dc * s
+            if not (0 <= rr < BOARD and 0 <= cc < BOARD):
+                break
+            if board.states.get(rr * BOARD + cc) != player:
+                break
+            cnt += 1
+        for s in range(1, N_IN_ROW):
+            rr, cc = r - dr * s, c - dc * s
+            if not (0 <= rr < BOARD and 0 <= cc < BOARD):
+                break
+            if board.states.get(rr * BOARD + cc) != player:
+                break
+            cnt += 1
+        if cnt >= N_IN_ROW:
+            return True
+    return False
+
+
 class MCTSNode:
     def __init__(self, parent=None, prior=0.0):
         self.parent = parent
@@ -152,9 +176,32 @@ class MCTS:
                 leaf_value = 1.0 if winner == state.current_player else -1.0
         else:
             candidates = nearby_moves(state)
-            filtered = [(a, p) for a, p in action_probs if a in candidates]
-            filtered.sort(key=lambda x: x[1], reverse=True)
-            node.expand(filtered[:40] if filtered else action_probs)
+            # Force immediate wins and mandatory blocks.
+            current = state.current_player
+            opponent = 2 if current == 1 else 1
+            forced = None
+            for mv in candidates:
+                if makes_five(state, mv, current):
+                    forced = mv
+                    break
+            if forced is None:
+                threat = None
+                multiple = False
+                for mv in candidates:
+                    if makes_five(state, mv, opponent):
+                        if threat is None:
+                            threat = mv
+                        else:
+                            multiple = True
+                            break
+                if not multiple and threat is not None:
+                    forced = threat
+            if forced is not None:
+                node.expand([(forced, 1.0)])
+            else:
+                filtered = [(a, p) for a, p in action_probs if a in candidates]
+                filtered.sort(key=lambda x: x[1], reverse=True)
+                node.expand(filtered[:40] if filtered else action_probs)
         node.update_recursive(-leaf_value)
 
     def get_move(self, board, temp=1e-3):

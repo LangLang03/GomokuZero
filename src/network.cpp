@@ -677,8 +677,9 @@ void PureNet::init_params() {
     std::fill(c3_.b.begin(), c3_.b.end(), 0.0f);
     std::fill(act_c_.b.begin(), act_c_.b.end(), 0.0f);
     std::fill(act_fc_.b.begin(), act_fc_.b.end(), 0.0f);
-    std::fill(val_c_.b.begin(), val_c_.b.end(), 0.0f);
-    std::fill(val_fc1_.b.begin(), val_fc1_.b.end(), 0.0f);
+    // Keep the value head ReLU active from the start to avoid a dead branch.
+    std::fill(val_c_.b.begin(), val_c_.b.end(), 0.1f);
+    std::fill(val_fc1_.b.begin(), val_fc1_.b.end(), 0.1f);
     std::fill(val_fc2_.b.begin(), val_fc2_.b.end(), 0.0f);
     loaded_ = false;
     rebuild_quantized_weights();

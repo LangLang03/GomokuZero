@@ -143,6 +143,32 @@ void nearby_moves(const Board& board, std::vector<int>& out) {
         out.push_back((BOARD_SIZE / 2) * BOARD_SIZE + BOARD_SIZE / 2);
 }
 
+bool makes_five(const Board& board, int move, int player) {
+    const int row = move / BOARD_SIZE;
+    const int col = move % BOARD_SIZE;
+    static const int DR[4] = {0, 1, 1, 1};
+    static const int DC[4] = {1, 0, 1, -1};
+    for (int d = 0; d < 4; ++d) {
+        int count = 1;
+        for (int s = 1; s < N_IN_ROW; ++s) {
+            const int nr = row + DR[d] * s;
+            const int nc = col + DC[d] * s;
+            if (nr < 0 || nr >= BOARD_SIZE || nc < 0 || nc >= BOARD_SIZE) break;
+            if (board.at(nr * BOARD_SIZE + nc) != player) break;
+            ++count;
+        }
+        for (int s = 1; s < N_IN_ROW; ++s) {
+            const int nr = row - DR[d] * s;
+            const int nc = col - DC[d] * s;
+            if (nr < 0 || nr >= BOARD_SIZE || nc < 0 || nc >= BOARD_SIZE) break;
+            if (board.at(nr * BOARD_SIZE + nc) != player) break;
+            ++count;
+        }
+        if (count >= N_IN_ROW) return true;
+    }
+    return false;
+}
+
 uint64_t board_key(const Board& board) {
     return board.position_key();
 }
@@ -296,10 +322,36 @@ void expand_leaf(GameState& game, const LeafTask& task,
                  std::vector<std::pair<float, int>>& candidates) {
     nearby_moves(task.board, nearby);
     candidates.clear();
+
+    // Force immediate wins and mandatory blocks so MCTS cannot miss them.
+    const int current = task.board.current_player();
+    const int opponent = (current == 1) ? 2 : 1;
+    int forced = -1;
     for (int move : nearby) {
-        float prior = evaluation.policy[move];
-        if (!std::isfinite(prior) || prior < 0.0f) prior = 0.0f;
-        candidates.emplace_back(prior, move);
+        if (makes_five(task.board, move, current)) {
+            forced = move;
+            break;
+        }
+    }
+    if (forced < 0) {
+        int threat = -1;
+        bool multiple = false;
+        for (int move : nearby) {
+            if (makes_five(task.board, move, opponent)) {
+                if (threat == -1) threat = move;
+                else { multiple = true; break; }
+            }
+        }
+        if (!multiple && threat >= 0) forced = threat;
+    }
+    if (forced >= 0) {
+        candidates.emplace_back(1.0f, forced);
+    } else {
+        for (int move : nearby) {
+            float prior = evaluation.policy[move];
+            if (!std::isfinite(prior) || prior < 0.0f) prior = 0.0f;
+            candidates.emplace_back(prior, move);
+        }
     }
     const int keep = std::min<int>(MAX_CAND, candidates.size());
     if (keep > 0) {
