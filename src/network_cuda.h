@@ -17,6 +17,10 @@ public:
     void sync_to_cpu();
     bool save(const std::string& directory) const;
 
+    // Mirrors PureNet's optimiser settings so the CUDA and native training
+    // paths optimise the same objective.
+    void set_weight_decay(double weight_decay);
+
     void forward(const float* states, int batch, float* policy, float* value,
                  bool probabilities) const;
     PureNet::TrainStats train_step(const std::vector<float>& states, int batch,

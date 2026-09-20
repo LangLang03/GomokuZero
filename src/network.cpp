@@ -436,7 +436,7 @@ float horizontal_sum(__m256 value) {
 
 __attribute__((target("avx2,fma")))
 void fast_fc(const FCLayer& layer, const std::vector<float>& input,
-             std::vector<float>& output, bool relu) {
+             std::vector<float>& output, bool leaky) {
     output.resize(layer.out_n);
     int out = 0;
     for (; out + 4 <= layer.out_n; out += 4) {
@@ -464,7 +464,10 @@ void fast_fc(const FCLayer& layer, const std::vector<float>& input,
             for (int tail = in; tail < layer.in_n; ++tail)
                 sums[lane] += input[tail] * layer.w[
                     static_cast<size_t>(out + lane) * layer.in_n + tail];
-            output[out + lane] = relu ? std::max(0.0f, sums[lane]) : sums[lane];
+            output[out + lane] = leaky
+                ? (sums[lane] > 0.0f ? sums[lane]
+                                     : sums[lane] * LEAKY_RELU_ALPHA)
+                : sums[lane];
         }
     }
     for (; out < layer.out_n; ++out) {
@@ -479,7 +482,9 @@ void fast_fc(const FCLayer& layer, const std::vector<float>& input,
         float sum = horizontal_sum(accumulator) + layer.b[out];
         for (; in < layer.in_n; ++in)
             sum += input[in] * layer.w[static_cast<size_t>(out) * layer.in_n + in];
-        output[out] = relu ? std::max(0.0f, sum) : sum;
+        output[out] = leaky
+            ? (sum > 0.0f ? sum : sum * LEAKY_RELU_ALPHA)
+            : sum;
     }
 }
 
@@ -865,6 +870,17 @@ bool PureNet::cuda_available() const {
     return cuda_backend_ && cuda_backend_->available();
 }
 
+void PureNet::set_weight_decay(double weight_decay) {
+    adam_.set_weight_decay(weight_decay);
+    if (cuda_backend_) cuda_backend_->set_weight_decay(weight_decay);
+}
+
+double PureNet::weight_decay() const { return adam_.weight_decay(); }
+
+void PureNet::set_grad_clip(double max_norm) {
+    grad_clip_ = max_norm > 0.0 ? max_norm : 0.0;
+}
+
 void PureNet::set_cuda_enabled(bool enabled) {
     const bool requested = enabled && cuda_available();
     if (requested == cuda_enabled_) return;
@@ -1138,7 +1154,7 @@ PureNet::TrainStats PureNet::train_step(
         register_all_params();
         adam_registered_ = true;
     }
-    adam_.clip_grad_norm(10.0f);
+    adam_.clip_grad_norm(static_cast<float>(grad_clip_));
     adam_.step();
     rebuild_quantized_weights();
 

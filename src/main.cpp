@@ -17,7 +17,15 @@ static void print_usage() {
         "  train  --init <bin_dir> --games N --playout N --batch-games N\n"
         "         [--mix <prefix>] [--mix-ratio 0.5] [--check-freq 50]\n"
         "         [--threads N] [--int8] [--cpu] [--tag name]\n"
-        "         [--lr-multiplier 1.0] [--value-loss-weight 1.0]\n"
+        "         [--batch-size N] [--epochs N] [--buffer N]\n"
+        "         [--lr 2e-3] [--lr-final-fraction 0.1] [--lr-warmup 2]\n"
+        "         [--weight-decay 1e-4] [--grad-clip 2.0]\n"
+        "         [--label-smooth 0.1] [--value-loss-weight 1.0]\n"
+        "         [--augment 0|1] [--eval-games N]\n"
+        "         [--c-puct 5.0] [--temp-high 1.0] [--temp-low 0.5]\n"
+        "         [--temp-switch 30] [--dirichlet-eps 0.25]\n"
+        "         [--dirichlet-alpha 0.3] [--max-candidates 60]\n"
+        "         [--virtual-loss 3.0] [--unseen-smooth 0.05]\n"
         "  selfplay --model <bin_dir> --playout N --games N [--batch N]\n"
         "         [--threads N] [--int8] [--cpu] (CUDA is automatic)\n"
         "         (benchmark self-play throughput)\n"
@@ -26,34 +34,59 @@ static void print_usage() {
 
 int cmd_train(int argc, char** argv) {
     std::string init, mix, tag = "cpp";
-    int games = 1000, playout = 400, batch_games = 64;
-    int buffer = 10000, batch_size = 512, epochs = 5, check_freq = 50;
+    int games = 1000, batch_games = 64;
     int n_threads = -1;
     bool int8_inference = false;
     bool force_cpu = false;
-    float mix_ratio = 0.5f;
-    double lr_multiplier_init = 1.0;
-    double value_loss_weight = 1.0;
+
+    SearchConfig search;
+    TrainConfig train;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
+        auto next_int = [&]() { return i + 1 < argc ? std::stoi(argv[++i]) : 0; };
+        auto next_float = [&]() { return i + 1 < argc ? std::stof(argv[++i]) : 0.0f; };
+        auto next_double = [&]() { return i + 1 < argc ? std::stod(argv[++i]) : 0.0; };
         if (a == "--init") { if (i+1<argc) init = argv[++i]; }
-        else if (a == "--mix") { if (i+1<argc) mix = argv[++i]; }
-        else if (a == "--tag") { if (i+1<argc) tag = argv[++i]; }
-        else if (a == "--games") { if (i+1<argc) games = std::stoi(argv[++i]); }
-        else if (a == "--playout") { if (i+1<argc) playout = std::stoi(argv[++i]); }
-        else if (a == "--batch-games") { if (i+1<argc) batch_games = std::stoi(argv[++i]); }
-        else if (a == "--buffer") { if (i+1<argc) buffer = std::stoi(argv[++i]); }
-        else if (a == "--batch-size") { if (i+1<argc) batch_size = std::stoi(argv[++i]); }
-        else if (a == "--epochs") { if (i+1<argc) epochs = std::stoi(argv[++i]); }
-        else if (a == "--check-freq") { if (i+1<argc) check_freq = std::stoi(argv[++i]); }
-        else if (a == "--mix-ratio") { if (i+1<argc) mix_ratio = std::stof(argv[++i]); }
-        else if (a == "--lr-multiplier") { if (i+1<argc) lr_multiplier_init = std::stod(argv[++i]); }
-        else if (a == "--value-loss-weight") { if (i+1<argc) value_loss_weight = std::stod(argv[++i]); }
-        else if (a == "--threads") { if (i+1<argc) n_threads = std::stoi(argv[++i]); }
+        else if (a == "--mix") { if (i+1<argc) train.mix_data = argv[++i]; }
+        else if (a == "--tag") { if (i+1<argc) train.tag = argv[++i]; tag = train.tag; }
+        else if (a == "--games") { games = next_int(); train.game_batch_num = games; }
+        else if (a == "--playout") { search.n_playout = next_int(); }
+        else if (a == "--batch-games") { batch_games = next_int(); search.batch_games = batch_games; }
+        else if (a == "--buffer") { train.buffer_size = next_int(); }
+        else if (a == "--batch-size") { train.batch_size = next_int(); }
+        else if (a == "--epochs") { train.epochs = next_int(); }
+        else if (a == "--check-freq") { train.check_freq = next_int(); }
+        else if (a == "--mix-ratio") { train.mix_ratio = next_float(); }
+        else if (a == "--threads") { n_threads = next_int(); }
         else if (a == "--int8") { int8_inference = true; }
         else if (a == "--cpu") { force_cpu = true; }
+        // Optimiser / schedule.
+        else if (a == "--lr") { train.lr_base = next_double(); }
+        else if (a == "--lr-final-fraction") { train.lr_final_fraction = next_double(); }
+        else if (a == "--lr-warmup") { train.lr_warmup_batches = next_int(); }
+        else if (a == "--weight-decay") { train.weight_decay = next_double(); }
+        else if (a == "--grad-clip") { train.grad_clip = next_double(); }
+        else if (a == "--label-smooth") { train.label_smooth = next_float(); }
+        else if (a == "--value-loss-weight") { train.value_loss_weight = next_double(); }
+        else if (a == "--augment") { train.augment = next_int() != 0; }
+        else if (a == "--eval-games") { train.eval_games = next_int(); }
+        // Search / self-play.
+        else if (a == "--c-puct") { search.c_puct = next_float(); }
+        else if (a == "--temp-high") { search.temp_high = next_float(); }
+        else if (a == "--temp-low") { search.temp_low = next_float(); }
+        else if (a == "--temp-switch") { search.temp_switch_move = next_int(); }
+        else if (a == "--dirichlet-eps") { search.dirichlet_eps = next_float(); }
+        else if (a == "--dirichlet-alpha") { search.dirichlet_alpha = next_float(); }
+        else if (a == "--max-candidates") { search.max_candidates = next_int(); }
+        else if (a == "--virtual-loss") { search.virtual_loss = next_float(); }
+        else if (a == "--unseen-smooth") { search.unseen_move_smooth = next_float(); }
+        else {
+            std::cerr << "unknown option: " << a << "\n";
+            return 2;
+        }
     }
+    search.n_threads = n_threads;
 
     PureNet net(2e-3);
     net.set_cuda_enabled(!force_cpu);
@@ -63,10 +96,11 @@ int cmd_train(int argc, char** argv) {
     net.set_quantized_inference(int8_inference);
     if (int8_inference && net.using_cuda())
         std::cerr << "[net] --int8 is CPU-only; CUDA uses FP32/TF32\n";
-    Trainer trainer(net, playout, batch_games, n_threads, 5.0f, 1.0f,
-                    buffer, batch_size, epochs, check_freq, games,
-                    mix, mix_ratio, tag, lr_multiplier_init,
-                    value_loss_weight);
+    std::cerr << "[net] backend: "
+              << (net.using_cuda() ? "CUDA (LibTorch)" : "CPU (native)")
+              << "\n";
+
+    Trainer trainer(net, search, train);
     trainer.run();
     return 0;
 }

@@ -74,6 +74,8 @@ public:
 
     void set_lr(double lr) { lr_ = lr; }
     double lr() const { return lr_; }
+    void set_weight_decay(double weight_decay) { weight_decay_ = weight_decay; }
+    double weight_decay() const { return weight_decay_; }
 
 private:
     double lr_, beta1_, beta2_, eps_, weight_decay_;

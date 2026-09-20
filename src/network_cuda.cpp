@@ -82,7 +82,9 @@ struct CudaNetworkBackend::Impl {
             at::globalContext().setAllowTF32CuBLAS(true);
             net->to(device);
             optimizer = std::make_unique<torch::optim::Adam>(
-                net->parameters(), torch::optim::AdamOptions(learning_rate));
+                net->parameters(),
+                torch::optim::AdamOptions(learning_rate)
+                    .weight_decay(owner.weight_decay()));
         } catch (const c10::Error& error) {
             std::cerr << "[net] CUDA initialization failed: "
                       << error.what_without_backtrace() << '\n';
@@ -121,6 +123,13 @@ CudaNetworkBackend::CudaNetworkBackend(PureNet& owner, double learning_rate)
 CudaNetworkBackend::~CudaNetworkBackend() = default;
 
 bool CudaNetworkBackend::available() const { return impl_->available; }
+
+void CudaNetworkBackend::set_weight_decay(double weight_decay) {
+    if (!impl_->available || !impl_->optimizer) return;
+    for (auto& group : impl_->optimizer->param_groups())
+        static_cast<torch::optim::AdamOptions&>(group.options())
+            .weight_decay(weight_decay);
+}
 
 void CudaNetworkBackend::sync_from_cpu() {
     if (!available()) return;
@@ -241,7 +250,9 @@ PureNet::TrainStats CudaNetworkBackend::train_step(
         policy_target * log_policy, 1));
     const auto loss = value_loss * value_loss_weight + policy_loss;
     loss.backward();
-    torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), 10.0);
+    const double clip = impl_->owner.grad_clip();
+    if (clip > 0.0)
+        torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), clip);
     impl_->optimizer->step();
     const auto entropy = -torch::mean(torch::sum(
         torch::exp(log_policy) * log_policy, 1));

@@ -35,6 +35,21 @@ enum NodeState : uint8_t {
     NODE_EXPANDED = 2,
 };
 
+// Virtual loss booked while a playout is in flight.
+//
+// Selection maximises -q, where q is the value stored on the *child* (from
+// the child's own point of view). Adding a positive amount to the child's
+// value_sum therefore lowers the parent's score for that child and pushes
+// concurrent threads onto different branches. Without it every thread dives
+// into the same child, collides on NODE_EXPANDING and burns the playout
+// budget on retries.
+//
+// The weights are integers because the node counters are lock-free atomics.
+struct VirtualLossWeights {
+    int32_t visits = 3;
+    int64_t value_sum = 3;  // units of VALUE_SCALE
+};
+
 // state publishes the immutable child range. Search counters are atomic.
 struct alignas(32) GNode {
     std::atomic<int64_t> value_sum{0};
@@ -100,20 +115,29 @@ void reset_tree(GameState& game) {
     initialize_node(game.nodes[0]);
 }
 
-void release_virtual_loss(GameState& game, const PathRec& path) {
-    for (int i = 0; i < path.len; ++i)
-        game.nodes[path.nodes[i]].virtual_visits.fetch_sub(
-            1, std::memory_order_relaxed);
+// Undoes a virtual loss booked by select_leaf for one path entry.
+void release_virtual_loss(GameState& game, const PathRec& path,
+                          const VirtualLossWeights& loss) {
+    for (int i = 0; i < path.len; ++i) {
+        GNode& node = game.nodes[path.nodes[i]];
+        node.virtual_visits.fetch_sub(loss.visits, std::memory_order_relaxed);
+        node.value_sum.fetch_sub(loss.value_sum, std::memory_order_relaxed);
+    }
 }
 
-void backup_path(GameState& game, const PathRec& path, float leaf_value) {
+void backup_path(GameState& game, const PathRec& path, float leaf_value,
+                 const VirtualLossWeights& loss) {
+    // The path still carries its virtual loss, so each entry must be
+    // corrected by that amount before the real value is applied.
     int64_t value = static_cast<int64_t>(std::llround(
         static_cast<double>(leaf_value) * VALUE_SCALE));
     for (int i = path.len - 1; i >= 0; --i) {
         GNode& node = game.nodes[path.nodes[i]];
-        node.value_sum.fetch_add(value, std::memory_order_relaxed);
+        node.value_sum.fetch_add(value - loss.value_sum,
+                                 std::memory_order_relaxed);
         node.visits.fetch_add(1, std::memory_order_relaxed);
-        node.virtual_visits.fetch_sub(1, std::memory_order_relaxed);
+        node.virtual_visits.fetch_sub(loss.visits,
+                                      std::memory_order_relaxed);
         value = -value;
     }
 }
@@ -229,18 +253,22 @@ void pin_search_worker(int, const std::vector<int>&) {}
 enum class SelectionResult { Retry, NeedsInference, Terminal };
 
 SelectionResult select_leaf(GameState& game, float c_puct, LeafTask& task,
-                            float& terminal_value) {
+                            float& terminal_value,
+                            const VirtualLossWeights& loss) {
     task.board = game.board;
     task.path.len = 1;
     task.path.nodes[0] = 0;
     int node_index = 0;
-    game.nodes[0].virtual_visits.fetch_add(1, std::memory_order_relaxed);
+    game.nodes[0].virtual_visits.fetch_add(loss.visits,
+                                           std::memory_order_relaxed);
+    game.nodes[0].value_sum.fetch_add(loss.value_sum,
+                                      std::memory_order_relaxed);
 
     while (true) {
         GNode& node = game.nodes[node_index];
         const uint8_t state = node.state.load(std::memory_order_acquire);
         if (state == NODE_EXPANDING) {
-            release_virtual_loss(game, task.path);
+            release_virtual_loss(game, task.path, loss);
             return SelectionResult::Retry;
         }
         if (state == NODE_UNEXPANDED) {
@@ -248,7 +276,7 @@ SelectionResult select_leaf(GameState& game, float c_puct, LeafTask& task,
             if (!node.state.compare_exchange_strong(
                     expected, NODE_EXPANDING, std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
-                release_virtual_loss(game, task.path);
+                release_virtual_loss(game, task.path, loss);
                 return SelectionResult::Retry;
             }
             task.node = node_index;
@@ -286,8 +314,7 @@ SelectionResult select_leaf(GameState& game, float c_puct, LeafTask& task,
             const int virtual_visits = child.virtual_visits.load(
                 std::memory_order_relaxed);
             const int effective_visits = visits + virtual_visits;
-            const int64_t sum = child.value_sum.load(std::memory_order_relaxed) +
-                static_cast<int64_t>(virtual_visits) * VALUE_SCALE;
+            const int64_t sum = child.value_sum.load(std::memory_order_relaxed);
             const float q = effective_visits == 0 ? 0.0f
                 : (static_cast<float>(sum) *
                    (1.0f / static_cast<float>(VALUE_SCALE))) /
@@ -300,15 +327,19 @@ SelectionResult select_leaf(GameState& game, float c_puct, LeafTask& task,
             }
         }
         GNode& child = game.nodes[best_index];
-        child.virtual_visits.fetch_add(1, std::memory_order_relaxed);
+        child.virtual_visits.fetch_add(loss.visits, std::memory_order_relaxed);
+        child.value_sum.fetch_add(loss.value_sum, std::memory_order_relaxed);
         if (task.path.len >= static_cast<int>(task.path.nodes.size())) {
-            child.virtual_visits.fetch_sub(1, std::memory_order_relaxed);
-            release_virtual_loss(game, task.path);
+            child.virtual_visits.fetch_sub(loss.visits,
+                                           std::memory_order_relaxed);
+            child.value_sum.fetch_sub(loss.value_sum,
+                                      std::memory_order_relaxed);
+            release_virtual_loss(game, task.path, loss);
             throw std::logic_error("MCTS path exceeds board size");
         }
         task.path.nodes[task.path.len++] = best_index;
         if (!task.board.is_empty(child.action)) {
-            release_virtual_loss(game, task.path);
+            release_virtual_loss(game, task.path, loss);
             throw std::logic_error("MCTS selected an occupied cell");
         }
         task.board.play(child.action);
@@ -319,7 +350,9 @@ SelectionResult select_leaf(GameState& game, float c_puct, LeafTask& task,
 void expand_leaf(GameState& game, const LeafTask& task,
                  const CachedEvaluation& evaluation,
                  std::vector<int>& nearby,
-                 std::vector<std::pair<float, int>>& candidates) {
+                 std::vector<std::pair<float, int>>& candidates,
+                 int max_candidates, float dirichlet_eps,
+                 float dirichlet_alpha, std::mt19937& rng) {
     nearby_moves(task.board, nearby);
     candidates.clear();
 
@@ -353,7 +386,7 @@ void expand_leaf(GameState& game, const LeafTask& task,
             candidates.emplace_back(prior, move);
         }
     }
-    const int keep = std::min<int>(MAX_CAND, candidates.size());
+    const int keep = std::min<int>(max_candidates, candidates.size());
     if (keep > 0) {
         std::partial_sort(candidates.begin(), candidates.begin() + keep,
                           candidates.end(),
@@ -363,17 +396,40 @@ void expand_leaf(GameState& game, const LeafTask& task,
     for (int i = 0; i < keep; ++i) prior_sum += candidates[i].first;
     if (!(prior_sum > 0.0f) && keep > 0) prior_sum = static_cast<float>(keep);
 
+    std::vector<float> priors(static_cast<size_t>(keep));
+    for (int i = 0; i < keep; ++i) {
+        priors[i] = candidates[i].first > 0.0f
+            ? candidates[i].first / prior_sum : 1.0f / prior_sum;
+    }
+
+    // Root Dirichlet noise. Without it MCTS just follows the prior, so a
+    // mis-prioritised branch is never explored and self-play games repeat.
+    const bool at_root = task.path.len == 1;
+    if (at_root && dirichlet_eps > 0.0f && keep > 1) {
+        std::gamma_distribution<float> gamma(dirichlet_alpha, 1.0f);
+        float noise_sum = 0.0f;
+        std::vector<float> noise(static_cast<size_t>(keep));
+        for (int i = 0; i < keep; ++i) {
+            noise[i] = gamma(rng);
+            noise_sum += noise[i];
+        }
+        if (noise_sum > 0.0f) {
+            const float keep_prior = 1.0f - dirichlet_eps;
+            for (int i = 0; i < keep; ++i)
+                priors[i] = keep_prior * priors[i] +
+                            dirichlet_eps * (noise[i] / noise_sum);
+        }
+    }
+
     GNode& leaf = game.nodes[task.node];
     if (keep > 0) {
         const uint32_t begin = game.next_node.fetch_add(
             static_cast<uint32_t>(keep), std::memory_order_relaxed);
         if (static_cast<size_t>(begin) + keep > game.node_capacity)
             throw std::overflow_error("MCTS node arena exhausted");
-        for (int i = 0; i < keep; ++i) {
-            const float prior = candidates[i].first > 0.0f
-                ? candidates[i].first / prior_sum : 1.0f / prior_sum;
-            initialize_node(game.nodes[begin + i], candidates[i].second, prior);
-        }
+        for (int i = 0; i < keep; ++i)
+            initialize_node(game.nodes[begin + i], candidates[i].second,
+                            priors[i]);
         leaf.child_begin = begin;
         leaf.child_count = static_cast<uint8_t>(keep);
     } else {
@@ -385,12 +441,12 @@ void expand_leaf(GameState& game, const LeafTask& task,
 
 }  // namespace
 
-BatchedSelfPlay::BatchedSelfPlay(PureNet& net, float c_puct,
-                                 int n_playout, int batch_games, int n_threads)
-    : net_(net), c_puct_(c_puct), n_playout_(n_playout),
-      batch_games_(batch_games) {
+BatchedSelfPlay::BatchedSelfPlay(PureNet& net, const SearchConfig& config)
+    : net_(net), config_(config), c_puct_(config.c_puct),
+      n_playout_(config.n_playout), batch_games_(config.batch_games) {
     if (n_playout_ <= 0 || batch_games_ <= 0)
         throw std::invalid_argument("playout and batch size must be positive");
+    int n_threads = config.n_threads;
     if (n_threads <= 0) {
         const unsigned hardware_threads = std::thread::hardware_concurrency();
         n_threads = hardware_threads == 0 ? 1
@@ -424,11 +480,37 @@ BatchedSelfPlay::BatchedSelfPlay(PureNet& net, float c_puct,
     mcts_threads_ = std::max(1, std::min(mcts_threads_, 32));
 }
 
+BatchedSelfPlay::BatchedSelfPlay(PureNet& net, float c_puct, int n_playout,
+                                 int batch_games, int n_threads)
+    : BatchedSelfPlay(net, [&] {
+          SearchConfig config;
+          config.c_puct = c_puct;
+          config.n_playout = n_playout;
+          config.batch_games = batch_games;
+          config.n_threads = n_threads;
+          // Keep the historical behaviour: no root noise, flat temperature.
+          config.dirichlet_eps = 0.0f;
+          config.temp_high = 1.0f;
+          config.temp_low = 1.0f;
+          return config;
+      }()) {}
+
 std::vector<std::vector<BatchedSelfPlay::Sample>>
-BatchedSelfPlay::run_batch(float temp) {
+BatchedSelfPlay::run_batch(float fixed_temp) {
     const int batch = batch_games_;
     std::unique_ptr<GameState[]> games(new GameState[batch]);
-    const size_t arena_capacity = 1 + static_cast<size_t>(n_playout_) * MAX_CAND;
+    const size_t arena_capacity =
+        1 + static_cast<size_t>(n_playout_) * config_.max_candidates;
+
+    // Derive the integer virtual-loss weights from the configured strength.
+    VirtualLossWeights virtual_loss;
+    {
+        const float strength = std::max(0.0f, config_.virtual_loss);
+        virtual_loss.visits = static_cast<int32_t>(
+            std::max(1.0f, std::round(strength)));
+        virtual_loss.value_sum = static_cast<int64_t>(
+            std::llround(static_cast<double>(strength) * VALUE_SCALE));
+    }
     for (int gi = 0; gi < batch; ++gi) {
         games[gi].node_capacity = arena_capacity;
         games[gi].nodes = std::make_unique<GNode[]>(arena_capacity);
@@ -519,6 +601,10 @@ BatchedSelfPlay::run_batch(float temp) {
                     worker_nearby.reserve(BOARD_CELLS);
                     std::vector<std::pair<float, int>> worker_candidates;
                     worker_candidates.reserve(BOARD_CELLS);
+                    // Private stream: expand_leaf is called concurrently by
+                    // every worker, so it must not share an RNG.
+                    std::mt19937 noise_rng(seed + 0x85ebca6bU *
+                                           static_cast<uint32_t>(worker + 1));
                     auto complete_one = [&]() {
                         int head = completion_head.load(
                             std::memory_order_relaxed);
@@ -534,10 +620,15 @@ BatchedSelfPlay::run_batch(float temp) {
                                 expand_leaf(completed_game, completed_task,
                                             completed_task.evaluation,
                                             worker_nearby,
-                                            worker_candidates);
+                                            worker_candidates,
+                                            config_.max_candidates,
+                                            config_.dirichlet_eps,
+                                            config_.dirichlet_alpha,
+                                            noise_rng);
                                 backup_path(completed_game,
                                             completed_task.path,
-                                            completed_task.evaluation.value);
+                                            completed_task.evaluation.value,
+                                            virtual_loss);
                                 completed.fetch_add(
                                     1, std::memory_order_release);
                                 return true;
@@ -597,7 +688,7 @@ BatchedSelfPlay::run_batch(float temp) {
                             float terminal_value = 0.0f;
                             const SelectionResult selected = select_leaf(
                                 games[game_index], c_puct_, task,
-                                terminal_value);
+                                terminal_value, virtual_loss);
                             if (selected == SelectionResult::Retry) {
                                 complete_one();
                                 std::this_thread::yield();
@@ -605,7 +696,7 @@ BatchedSelfPlay::run_batch(float temp) {
                             }
                             if (selected == SelectionResult::Terminal) {
                                 backup_path(games[game_index], task.path,
-                                            terminal_value);
+                                            terminal_value, virtual_loss);
                                 completed.fetch_add(1,
                                                     std::memory_order_release);
                             } else {
@@ -754,6 +845,12 @@ BatchedSelfPlay::run_batch(float temp) {
                 continue;
             }
 
+            // A negative override means "use the configured schedule", which
+            // explores the opening and sharpens later moves.
+            const float temp = fixed_temp >= 0.0f
+                ? fixed_temp
+                : config_.temperature_at(game.board.move_count());
+
             std::vector<float> weights(root.child_count);
             if (temp <= 1e-6f) {
                 int best = 0;
@@ -790,6 +887,18 @@ BatchedSelfPlay::run_batch(float temp) {
             for (int i = 0; i < root.child_count; ++i) {
                 const GNode& child = game.nodes[root.child_begin + i];
                 probs[child.action] = weights[i] / weight_sum;
+            }
+
+            // Reserve a little probability mass for legal moves MCTS never
+            // considered. Without this the target asserts p = 0 for positions
+            // that are merely unvisited, which trains the policy to consider
+            // them unplayable and removes any chance of MCTS correcting a
+            // mis-prioritised branch later.
+            if (config_.unseen_move_smooth > 0.0f) {
+                const float smooth = config_.unseen_move_smooth;
+                const float spread = smooth / static_cast<float>(BOARD_CELLS);
+                for (int m = 0; m < BOARD_CELLS; ++m)
+                    probs[m] = probs[m] * (1.0f - smooth) + spread;
             }
             std::array<float, 4 * BOARD_CELLS> state{};
             game.board.encode_state(state.data());

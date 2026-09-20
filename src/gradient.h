@@ -62,10 +62,15 @@ inline void relu_forward(std::vector<float>& x) {
 // y is the post-ReLU activation.
 void relu_backward(const std::vector<float>& y, std::vector<float>& grad);
 
-// Leaky ReLU for the value head to avoid dead neurons.
-void leaky_relu_forward(std::vector<float>& x, float alpha = 0.01f);
+// Leaky ReLU for the value head to avoid dead neurons. Every code path that
+// activates the value branch must use this same slope, including the AVX fast
+// path in network.cpp.
+constexpr float LEAKY_RELU_ALPHA = 0.01f;
+
+void leaky_relu_forward(std::vector<float>& x,
+                        float alpha = LEAKY_RELU_ALPHA);
 void leaky_relu_backward(const std::vector<float>& y,
                          std::vector<float>& grad,
-                         float alpha = 0.01f);
+                         float alpha = LEAKY_RELU_ALPHA);
 
 }  // namespace gomoku

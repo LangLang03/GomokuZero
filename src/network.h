@@ -51,6 +51,13 @@ public:
     // Only one thread may submit a batch at a time.
     void set_inference_threads(int threads);
     int inference_threads() const { return inference_threads_; }
+
+    // Optimiser settings. The CUDA backend mirrors these so both training
+    // paths optimise the same objective.
+    void set_weight_decay(double weight_decay);
+    double weight_decay() const;
+    void set_grad_clip(double max_norm);
+    double grad_clip() const { return grad_clip_; }
     bool using_cuda() const { return cuda_enabled_; }
     bool cuda_available() const;
     void set_cuda_enabled(bool enabled);
@@ -73,6 +80,7 @@ private:
     bool loaded_ = false;
     bool adam_registered_ = false;
     int inference_threads_ = 1;
+    double grad_clip_ = 2.0;
     bool fast_inference_enabled_ = true;
     bool quantized_inference_enabled_ = false;
     std::vector<int8_t> quantized_c2_, quantized_c3_;

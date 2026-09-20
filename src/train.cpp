@@ -1,69 +1,172 @@
 #include "train.h"
 #include "logger.h"
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <algorithm>
 #include <random>
-#include <chrono>
-#include <cstdlib>
 
 namespace gomoku {
 
-static bool read_bin(const std::string& path, std::vector<float>& out) {
+namespace {
+
+bool read_bin(const std::string& path, std::vector<float>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     uint64_t count = 0;
     f.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!f) return false;
     out.resize(count);
     f.read(reinterpret_cast<char*>(out.data()),
            static_cast<std::streamsize>(count * sizeof(float)));
-    f.close();
-    return true;
+    return static_cast<bool>(f);
 }
 
-Trainer::Trainer(PureNet& net, int n_playout, int batch_games,
-                 int n_threads, float c_puct, float temp, int buffer_size,
-                 int batch_size, int epochs, int check_freq, int game_batch_num,
-                 const std::string& mix_data, float mix_ratio,
-                 const std::string& tag,
-                 double lr_multiplier_init,
-                 double value_loss_weight)
-    : net_(net), n_playout_(n_playout), batch_games_(batch_games),
-      n_threads_(n_threads), buffer_size_(buffer_size), batch_size_(batch_size),
-      epochs_(epochs), check_freq_(check_freq), game_batch_num_(game_batch_num),
-      c_puct_(c_puct), temp_(temp), mix_data_(mix_data), mix_ratio_(mix_ratio),
-      tag_(tag), lr_multiplier_(lr_multiplier_init),
-      value_loss_weight_(value_loss_weight) {
-    buffer_.reserve(buffer_size_);
+// Index of the cell a board cell maps to after transform `t`.
+//
+// t & 3 selects a rotation, t & 4 optionally mirrors. The set of eight
+// values forms the dihedral group of the square.
+int transform_cell(int cell, int t) {
+    int row = cell / BOARD_SIZE;
+    int col = cell % BOARD_SIZE;
+    int r = row, c = col;
+    switch (t & 3) {
+        case 1: r = col;              c = BOARD_SIZE - 1 - row; break;
+        case 2: r = BOARD_SIZE - 1 - row; c = BOARD_SIZE - 1 - col; break;
+        case 3: r = BOARD_SIZE - 1 - col; c = row;              break;
+        default: break;
+    }
+    if (t & 4) c = BOARD_SIZE - 1 - c;
+    return r * BOARD_SIZE + c;
+}
+
+// Applies transform `t` to a [4][15][15] state plane set.
+void transform_state(const float* src, float* dst, int t) {
+    for (int ch = 0; ch < 4; ++ch) {
+        const float* in = src + static_cast<size_t>(ch) * BOARD_CELLS;
+        float* out = dst + static_cast<size_t>(ch) * BOARD_CELLS;
+        for (int cell = 0; cell < BOARD_CELLS; ++cell)
+            out[transform_cell(cell, t)] = in[cell];
+    }
+}
+
+// Blends `epsilon` of uniform mass into a target distribution.
+void apply_label_smoothing(std::vector<float>& probs, float epsilon) {
+    if (epsilon <= 0.0f) return;
+    const size_t n = probs.size();
+    if (n == 0) return;
+    const float spread = epsilon / static_cast<float>(n);
+    const float keep = 1.0f - epsilon;
+    for (float& p : probs) p = p * keep + spread;
+}
+
+double policy_kl(const std::vector<float>& log_p, const std::vector<float>& log_q,
+                 std::vector<float>& scratch, int probes) {
+    double total = 0.0;
+    for (int i = 0; i < probes; ++i) {
+        const float* lp = log_p.data() + static_cast<size_t>(i) * BOARD_CELLS;
+        const float* lq = log_q.data() + static_cast<size_t>(i) * BOARD_CELLS;
+        double row = 0.0;
+        for (int k = 0; k < BOARD_CELLS; ++k)
+            row += static_cast<double>(std::exp(lp[k])) * (lp[k] - lq[k]);
+        total += row;
+    }
+    (void)scratch;
+    return probes > 0 ? total / probes : 0.0;
+}
+
+}  // namespace
+
+Trainer::Trainer(PureNet& net, const SearchConfig& search,
+                 const TrainConfig& config)
+    : net_(net), search_(search), config_(config) {
+    buffer_.reserve(config_.buffer_size);
+    net_.set_weight_decay(config_.weight_decay);
+    net_.set_grad_clip(static_cast<float>(config_.grad_clip));
     load_mix_data();
 }
 
 void Trainer::load_mix_data() {
-    if (mix_data_.empty()) {
+    if (config_.mix_data.empty()) {
         logger.log("[train] no mix data");
         return;
     }
     std::vector<float> all_s, all_p, all_w;
-    if (!read_bin(mix_data_ + "_states.bin", all_s) ||
-        !read_bin(mix_data_ + "_probs.bin", all_p) ||
-        !read_bin(mix_data_ + "_winners.bin", all_w)) {
-        logger.log("[train] mix data load failed (%s*)", mix_data_.c_str());
+    if (!read_bin(config_.mix_data + "_states.bin", all_s) ||
+        !read_bin(config_.mix_data + "_probs.bin", all_p) ||
+        !read_bin(config_.mix_data + "_winners.bin", all_w)) {
+        logger.log("[train] mix data load failed (%s*)", config_.mix_data.c_str());
         n_mix_ = 0;
         return;
     }
-    int64_t total = static_cast<int64_t>(all_w.size());
-    n_val_ = std::max<int64_t>(1, total / 20);
-    n_mix_ = total - n_val_;
-    const size_t per_state = 4 * 225, per_prob = 225;
-    val_states_.assign(all_s.begin(), all_s.begin() + n_val_ * per_state);
-    val_probs_.assign(all_p.begin(), all_p.begin() + n_val_ * per_prob);
-    val_winners_.assign(all_w.begin(), all_w.begin() + n_val_);
-    mix_states_.assign(all_s.begin() + n_val_ * per_state, all_s.end());
-    mix_probs_.assign(all_p.begin() + n_val_ * per_prob, all_p.end());
-    mix_winners_.assign(all_w.begin() + n_val_, all_w.end());
-    logger.log("[train] mix data loaded: %lld train + %lld val samples (%s*)",
-               (long long)n_mix_, (long long)n_val_, mix_data_.c_str());
+    const size_t per_state = 4 * BOARD_CELLS;
+    const int64_t total = static_cast<int64_t>(all_w.size());
+    if (total <= 0 || all_s.size() < static_cast<size_t>(total) * per_state ||
+        all_p.size() < static_cast<size_t>(total) * BOARD_CELLS) {
+        logger.log("[train] mix data inconsistent (%lld winners, %zu states)",
+                   static_cast<long long>(total), all_s.size());
+        n_mix_ = 0;
+        return;
+    }
+
+    // Random split. The files are ordered by game, so a prefix split would
+    // make the validation set "the earliest games only".
+    std::vector<int64_t> order(static_cast<size_t>(total));
+    for (int64_t i = 0; i < total; ++i) order[static_cast<size_t>(i)] = i;
+    std::mt19937 rng(12345);
+    std::shuffle(order.begin(), order.end(), rng);
+
+    const int64_t n_val = std::max<int64_t>(1, total / 20);
+    const int64_t n_train = total - n_val;
+    n_val_ = n_val;
+    n_mix_ = n_train;
+    val_states_.assign(static_cast<size_t>(n_val) * per_state, 0.0f);
+    val_probs_.assign(static_cast<size_t>(n_val) * BOARD_CELLS, 0.0f);
+    val_winners_.assign(static_cast<size_t>(n_val), 0.0f);
+    mix_states_.assign(static_cast<size_t>(n_train) * per_state, 0.0f);
+    mix_probs_.assign(static_cast<size_t>(n_train) * BOARD_CELLS, 0.0f);
+    mix_winners_.assign(static_cast<size_t>(n_train), 0.0f);
+
+    auto copy_sample = [&](int64_t src, float* state, float* prob, float* win) {
+        std::memcpy(state, &all_s[static_cast<size_t>(src) * per_state],
+                    per_state * sizeof(float));
+        std::memcpy(prob, &all_p[static_cast<size_t>(src) * BOARD_CELLS],
+                    BOARD_CELLS * sizeof(float));
+        *win = all_w[static_cast<size_t>(src)];
+    };
+    for (int64_t i = 0; i < n_val; ++i)
+        copy_sample(order[static_cast<size_t>(i)],
+                    &val_states_[static_cast<size_t>(i) * per_state],
+                    &val_probs_[static_cast<size_t>(i) * BOARD_CELLS],
+                    &val_winners_[static_cast<size_t>(i)]);
+    for (int64_t i = 0; i < n_train; ++i)
+        copy_sample(order[static_cast<size_t>(n_val + i)],
+                    &mix_states_[static_cast<size_t>(i) * per_state],
+                    &mix_probs_[static_cast<size_t>(i) * BOARD_CELLS],
+                    &mix_winners_[static_cast<size_t>(i)]);
+
+    // Human records are stored as hard one-hot targets.
+    for (int64_t i = 0; i < n_train; ++i) {
+        std::vector<float> row(
+            mix_probs_.begin() + static_cast<size_t>(i) * BOARD_CELLS,
+            mix_probs_.begin() + static_cast<size_t>(i + 1) * BOARD_CELLS);
+        apply_label_smoothing(row, config_.label_smooth);
+        std::copy(row.begin(), row.end(),
+                  mix_probs_.begin() + static_cast<size_t>(i) * BOARD_CELLS);
+    }
+
+    // Reserve a small fixed probe batch for the KL diagnostic.
+    n_kl_ = static_cast<int>(std::min<int64_t>(256, n_train));
+    kl_states_.assign(static_cast<size_t>(n_kl_) * per_state, 0.0f);
+    std::memcpy(kl_states_.data(), mix_states_.data(),
+                kl_states_.size() * sizeof(float));
+
+    logger.log("[train] mix data loaded: %lld train + %lld val samples, "
+               "label_smooth=%.2f (%s*)",
+               static_cast<long long>(n_mix_), static_cast<long long>(n_val_),
+               config_.label_smooth, config_.mix_data.c_str());
 }
 
 void Trainer::add_samples(
@@ -74,160 +177,217 @@ void Trainer::add_samples(
             e.state.assign(s.state.begin(), s.state.end());
             e.probs.assign(s.probs.begin(), s.probs.end());
             e.z = s.z;
-            if (static_cast<int>(buffer_.size()) < buffer_size_) {
+            if (static_cast<int>(buffer_.size()) < config_.buffer_size) {
                 buffer_.push_back(std::move(e));
             } else {
                 buffer_[buf_head_] = std::move(e);
-                buf_head_ = (buf_head_ + 1) % buffer_size_;
+                buf_head_ = (buf_head_ + 1) % config_.buffer_size;
             }
         }
     }
 }
 
-void Trainer::policy_update() {
-    if (buffer_.size() < static_cast<size_t>(batch_size_)) return;
+double Trainer::learning_rate_for_batch(int batch_index) const {
+    const int total = std::max(1, config_.game_batch_num);
+    const int warmup = std::max(0, config_.lr_warmup_batches);
+    if (batch_index < warmup && warmup > 0) {
+        // Linear warmup from 10% of the base rate.
+        const double t = static_cast<double>(batch_index + 1) / warmup;
+        return config_.lr_base * (0.1 + 0.9 * t);
+    }
+    const double denominator =
+        static_cast<double>(std::max(1, total - warmup - 1));
+    const double progress = std::min(
+        1.0, std::max(0.0, static_cast<double>(batch_index - warmup) /
+                               denominator));
+    const double cosine = 0.5 * (1.0 + std::cos(M_PI * progress));
+    const double final_fraction = config_.lr_final_fraction;
+    return config_.lr_base * (final_fraction + (1.0 - final_fraction) * cosine);
+}
+
+void Trainer::policy_update(int batch_index) {
+    if (buffer_.size() < static_cast<size_t>(config_.batch_size)) return;
     std::mt19937 rng(std::random_device{}());
 
-    int n_self = static_cast<int>(buffer_.size());
+    const int batch_size = config_.batch_size;
+    const int n_self = static_cast<int>(buffer_.size());
     int n_mix = 0;
-    if (n_mix_ > 0) n_mix = static_cast<int>(batch_size_ * mix_ratio_);
-    int n_self_use = batch_size_ - n_mix;
+    if (n_mix_ > 0) n_mix = static_cast<int>(batch_size * config_.mix_ratio);
+    int n_self_use = batch_size - n_mix;
     if (n_self_use > n_self) {
         n_self_use = n_self;
-        n_mix = batch_size_ - n_self_use;
+        n_mix = batch_size - n_self_use;
     }
 
-    const size_t per_state = 4 * 225, per_prob = 225;
-    std::vector<float> s_buf((size_t)batch_size_ * per_state);
-    std::vector<float> p_buf((size_t)batch_size_ * per_prob);
-    std::vector<float> z_buf(batch_size_);
+    const size_t per_state = 4 * BOARD_CELLS, per_prob = BOARD_CELLS;
+    std::vector<float> s_buf(static_cast<size_t>(batch_size) * per_state);
+    std::vector<float> p_buf(static_cast<size_t>(batch_size) * per_prob);
+    std::vector<float> z_buf(batch_size);
 
     std::uniform_int_distribution<int> self_dist(0, n_self - 1);
+    std::uniform_int_distribution<int> sym_dist(0, config_.augment ? 7 : 0);
     for (int i = 0; i < n_self_use; ++i) {
         const Exp& e = buffer_[self_dist(rng)];
-        std::memcpy(&s_buf[(size_t)i * per_state], e.state.data(),
-                    per_state * sizeof(float));
-        std::memcpy(&p_buf[(size_t)i * per_prob], e.probs.data(),
-                    per_prob * sizeof(float));
+        const int t = sym_dist(rng);
+        float* state = &s_buf[static_cast<size_t>(i) * per_state];
+        float* prob = &p_buf[static_cast<size_t>(i) * per_prob];
+        if (t == 0) {
+            std::memcpy(state, e.state.data(), per_state * sizeof(float));
+            std::memcpy(prob, e.probs.data(), per_prob * sizeof(float));
+        } else {
+            transform_state(e.state.data(), state, t);
+            for (int cell = 0; cell < BOARD_CELLS; ++cell)
+                prob[transform_cell(cell, t)] = e.probs[cell];
+        }
         z_buf[i] = e.z;
     }
-    if (n_mix_ > 0 && n_mix > 0) {
+    if (n_mix > 0) {
         std::uniform_int_distribution<int64_t> mix_dist(0, n_mix_ - 1);
         for (int i = 0; i < n_mix; ++i) {
-            int64_t idx = mix_dist(rng);
-            std::memcpy(&s_buf[(size_t)(n_self_use + i) * per_state],
-                        &mix_states_[(size_t)idx * per_state],
-                        per_state * sizeof(float));
-            std::memcpy(&p_buf[(size_t)(n_self_use + i) * per_prob],
-                        &mix_probs_[(size_t)idx * per_prob],
-                        per_prob * sizeof(float));
-            z_buf[n_self_use + i] = mix_winners_[idx];
+            const int64_t idx = mix_dist(rng);
+            const int t = sym_dist(rng);
+            float* state = &s_buf[static_cast<size_t>(n_self_use + i) * per_state];
+            float* prob = &p_buf[static_cast<size_t>(n_self_use + i) * per_prob];
+            const float* src_state =
+                &mix_states_[static_cast<size_t>(idx) * per_state];
+            const float* src_prob =
+                &mix_probs_[static_cast<size_t>(idx) * per_prob];
+            if (t == 0) {
+                std::memcpy(state, src_state, per_state * sizeof(float));
+                std::memcpy(prob, src_prob, per_prob * sizeof(float));
+            } else {
+                transform_state(src_state, state, t);
+                for (int cell = 0; cell < BOARD_CELLS; ++cell)
+                    prob[transform_cell(cell, t)] = src_prob[cell];
+            }
+            z_buf[n_self_use + i] = mix_winners_[static_cast<size_t>(idx)];
         }
     }
 
-    double lr = 2e-3 * lr_multiplier_;
+    const double lr = learning_rate_for_batch(batch_index);
     PureNet::TrainStats stats{};
-    for (int e = 0; e < epochs_; ++e) {
-        stats = net_.train_step(s_buf, batch_size_, p_buf, z_buf, lr,
-                                value_loss_weight_);
+    for (int e = 0; e < config_.epochs; ++e)
+        stats = net_.train_step(s_buf, batch_size, p_buf, z_buf, lr,
+                                config_.value_loss_weight);
+    logger.log("batch %d loss:%.6f entropy:%.6f lr:%.6f", batch_index + 1,
+               stats.loss, stats.entropy, lr);
+}
+
+void Trainer::log_true_kl(int batch_index) {
+    if (n_kl_ <= 0 || n_mix_ <= 0) return;
+    const size_t per_state = 4 * BOARD_CELLS, per_prob = BOARD_CELLS;
+    const int probes = std::min<int>(n_kl_, 128);
+    std::vector<float> states(static_cast<size_t>(probes) * per_state);
+    std::vector<float> probs(static_cast<size_t>(probes) * per_prob);
+    std::vector<float> winners(probes, 0.0f);
+    std::vector<int64_t> order(static_cast<size_t>(n_mix_));
+    for (int64_t i = 0; i < n_mix_; ++i) order[static_cast<size_t>(i)] = i;
+    std::mt19937 rng(0x5bd1e995U ^ static_cast<uint32_t>(batch_index));
+    std::shuffle(order.begin(), order.end(), rng);
+    for (int i = 0; i < probes; ++i) {
+        const int64_t src = order[static_cast<size_t>(i)];
+        std::memcpy(&states[static_cast<size_t>(i) * per_state],
+                    &mix_states_[static_cast<size_t>(src) * per_state],
+                    per_state * sizeof(float));
+        std::memcpy(&probs[static_cast<size_t>(i) * per_prob],
+                    &mix_probs_[static_cast<size_t>(src) * per_prob],
+                    per_prob * sizeof(float));
+        winners[i] = mix_winners_[static_cast<size_t>(src)];
     }
 
-    // Approximate KL by the change in loss, smoothed to reduce noise.
-    static float prev_loss = 0;
-    static float smoothed_kl = 0.05f;
-    const float raw_kl = prev_loss > 0 ? std::abs(stats.loss - prev_loss) : 0.05f;
-    smoothed_kl = 0.7f * smoothed_kl + 0.3f * raw_kl;
-    const float kl = smoothed_kl;
-    prev_loss = stats.loss;
-    if (kl > kl_targ_ * 4) {
-        lr_multiplier_ /= 1.5;
-    } else if (kl > kl_targ_ * 2 && lr_multiplier_ > 0.1) {
-        lr_multiplier_ /= 1.5;
-    } else if (kl < kl_targ_ / 2 && lr_multiplier_ < 2.0) {
-        lr_multiplier_ *= 1.5;
-    }
+    std::vector<float> before(static_cast<size_t>(probes) * BOARD_CELLS);
+    std::vector<float> after(static_cast<size_t>(probes) * BOARD_CELLS);
+    std::vector<float> value(probes);
+    net_.forward_batch(states.data(), probes, before.data(), value.data());
 
-    // Avoid total LR collapse: keep a small minimum learning rate.
-    if (lr_multiplier_ < 0.01) lr_multiplier_ = 0.01;
-    if (lr_multiplier_ > 2.0) lr_multiplier_ = 2.0;
+    // One probe-sized step, so the KL measures the movement of the policy
+    // distribution rather than the distance between two identical forwards.
+    const double lr = learning_rate_for_batch(batch_index) * 0.1;
+    net_.train_step(states, probes, probs, winners, lr,
+                    config_.value_loss_weight);
 
-    logger.log("kl:%.5f,lr_multiplier:%.3f,loss:%.6f,entropy:%.6f",
-               kl, lr_multiplier_, stats.loss, stats.entropy);
+    net_.forward_batch(states.data(), probes, after.data(), value.data());
+    std::vector<float> scratch;
+    const double kl = policy_kl(before, after, scratch, probes);
+    logger.log("batch %d lr:%.6f true_kl:%.6f", batch_index + 1,
+               learning_rate_for_batch(batch_index), kl);
 }
 
 void Trainer::validate(int batch_idx) {
     if (n_val_ == 0) return;
-    const size_t per_state = 4 * 225, per_prob = 225;
+    const size_t per_state = 4 * BOARD_CELLS, per_prob = BOARD_CELLS;
     const int chunk = 512;
     double ploss_sum = 0, vloss_sum = 0;
     int correct = 0;
-    std::vector<float> lp(chunk * 225), val_out(chunk);
+    std::vector<float> lp(static_cast<size_t>(chunk) * BOARD_CELLS), val_out(chunk);
     for (int64_t off = 0; off < n_val_; off += chunk) {
-        int n = (int)std::min<int64_t>(chunk, n_val_ - off);
-        net_.forward_batch(&val_states_[(size_t)off * per_state], n,
+        const int n = static_cast<int>(std::min<int64_t>(chunk, n_val_ - off));
+        net_.forward_batch(&val_states_[static_cast<size_t>(off) * per_state], n,
                            lp.data(), val_out.data());
         for (int i = 0; i < n; ++i) {
-            const float* p = &val_probs_[(size_t)(off + i) * per_prob];
-            const float* l = &lp[(size_t)i * 225];
-            float z = val_winners_[off + i];
+            const float* p = &val_probs_[static_cast<size_t>(off + i) * per_prob];
+            const float* l = &lp[static_cast<size_t>(i) * BOARD_CELLS];
+            const float z = val_winners_[off + i];
             double pl = 0;
-            for (int k = 0; k < 225; ++k) pl -= (double)p[k] * l[k];
+            for (int k = 0; k < BOARD_CELLS; ++k)
+                pl -= static_cast<double>(p[k]) * l[k];
             ploss_sum += pl;
             vloss_sum += (val_out[i] - z) * (val_out[i] - z);
             int argmax_l = 0, argmax_p = 0;
-            for (int k = 1; k < 225; ++k) {
+            for (int k = 1; k < BOARD_CELLS; ++k) {
                 if (l[k] > l[argmax_l]) argmax_l = k;
                 if (p[k] > p[argmax_p]) argmax_p = k;
             }
             if (argmax_l == argmax_p) ++correct;
         }
     }
-    double n = (double)n_val_;
+    const double n = static_cast<double>(n_val_);
     logger.log("[val] batch %d | val_loss:%.4f (pol:%.4f val:%.4f) | top1_acc:%.3f",
-               batch_idx,
-               (ploss_sum + vloss_sum) / n,
-               ploss_sum / n, vloss_sum / n,
-               (double)correct / n);
+               batch_idx, (ploss_sum + vloss_sum) / n, ploss_sum / n,
+               vloss_sum / n, static_cast<double>(correct) / n);
 }
 
 void Trainer::evaluate_and_save(int batch_idx) {
-    std::string dir = "best_policy_" + tag_ + "_bin";
-    std::string cmd = "mkdir -p " + dir;
+    const std::string dir = "best_policy_" + config_.tag + "_bin";
+    const std::string cmd = "mkdir -p " + dir;
     (void)system(cmd.c_str());
     net_.save(dir);
-    logger.log("[train] batch %d model saved (best_policy_%s_bin)",
-               batch_idx, tag_.c_str());
+    logger.log("[train] batch %d model saved (%s)", batch_idx, dir.c_str());
 }
 
 void Trainer::run() {
-    BatchedSelfPlay sp(net_, c_puct_, n_playout_, batch_games_, n_threads_);
+    BatchedSelfPlay sp(net_, search_);
     auto t0 = std::chrono::steady_clock::now();
     auto t_last = t0;
 
-    for (int i = 0; i < game_batch_num_; ++i) {
-        auto batches = sp.run_batch(temp_);
+    for (int i = 0; i < config_.game_batch_num; ++i) {
+        // Negative override: use the configured temperature schedule.
+        auto batches = sp.run_batch(-1.0f);
         add_samples(batches);
         int n_samples = 0;
         for (auto& g : batches) n_samples += static_cast<int>(g.size());
 
-        policy_update();
+        policy_update(i);
+        if ((i + 1) % 5 == 0) log_true_kl(i);
 
-        auto now = std::chrono::steady_clock::now();
-        float dt = std::chrono::duration<float>(now - t_last).count();
-        float elapsed = std::chrono::duration<float>(now - t0).count();
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::chrono::duration<float>(now - t_last).count();
+        const float elapsed = std::chrono::duration<float>(now - t0).count();
         t_last = now;
 
-        float eta = dt * (game_batch_num_ - i - 1) / 3600.0f;
-        logger.log("batch i:%d/%d, samples:%d, buffer:%zu, selfplay_time:%.1fs",
-                   i + 1, game_batch_num_, n_samples, buffer_.size(), dt);
+        const float eta = dt * (config_.game_batch_num - i - 1) / 3600.0f;
+        logger.log("batch i:%d/%d, samples:%d, buffer:%zu, lr:%.6f, "
+                   "selfplay_time:%.1fs",
+                   i + 1, config_.game_batch_num, n_samples, buffer_.size(),
+                   learning_rate_for_batch(i), dt);
         if ((i + 1) % 10 == 0) {
             logger.log("[PROGRESS] batch %d/%d | elapsed %.1fh | ETA %.1fh",
-                       i + 1, game_batch_num_, elapsed / 3600.0f, eta);
+                       i + 1, config_.game_batch_num, elapsed / 3600.0f, eta);
         }
-        if ((i + 1) % check_freq_ == 0) evaluate_and_save(i + 1);
+        if ((i + 1) % config_.check_freq == 0) evaluate_and_save(i + 1);
         if ((i + 1) % 5 == 0) validate(i + 1);
     }
-    evaluate_and_save(game_batch_num_);
+    evaluate_and_save(config_.game_batch_num);
 }
 
 }  // namespace gomoku
