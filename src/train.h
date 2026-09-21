@@ -42,9 +42,11 @@ struct TrainConfig {
     // Real strength measurement: play `eval_games` games against a baseline
     // checkpoint every `eval_freq` batches. Validation loss on human records
     // only measures agreement with one-hot labels, not playing strength.
+    // The arena evaluates one position at a time, so its inference batches
+    // are size 1 and cost roughly 150x a batched evaluation. Keep it small.
     int eval_games = 0;       // 0 disables the arena
     int eval_freq = 50;
-    int eval_playout = 100;
+    int eval_playout = 30;
     std::string baseline_dir;
 
     std::string tag = "cpp";
@@ -80,15 +82,19 @@ private:
     std::vector<float> val_states_, val_probs_, val_winners_;
     int64_t n_val_ = 0;
 
-    // Fixed probe batch for the (diagnostic) KL estimate.
+    // Fixed probe batch for the (diagnostic) KL estimate. The distributions
+    // are captured around the normal optimisation step so the diagnostic has
+    // no effect on the training trajectory.
     std::vector<float> kl_states_;
+    std::vector<float> kl_before_, kl_after_;
     int n_kl_ = 0;
 
     void load_mix_data();
     void add_samples(
         const std::vector<std::vector<BatchedSelfPlay::Sample>>& batches);
     void policy_update(int batch_index);
-    void log_true_kl(int batch_index);
+    void update_kl_probe();
+    void log_true_kl(int batch_index) const;
     void evaluate_and_save(int batch_idx);
     void run_arena(int batch_idx);
     void validate(int batch_idx);

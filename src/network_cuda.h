@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,17 @@ public:
     // Mirrors PureNet's optimiser settings so the CUDA and native training
     // paths optimise the same objective.
     void set_weight_decay(double weight_decay);
+
+    // Full training-state access, so a checkpoint can carry the raw batch-norm
+    // parameterisation and the optimiser moments rather than only the folded
+    // inference weights.
+    bool save_training_state(const std::string& directory, int batch_index,
+                             int64_t step, const std::vector<float>& moments_m,
+                             const std::vector<float>& moments_v) const;
+    bool load_training_state(const std::string& directory, int* batch_index,
+                             int64_t* step, std::vector<float>* moments_m,
+                             std::vector<float>* moments_v);
+    bool has_training_state(const std::string& directory) const;
 
     void forward(const float* states, int batch, float* policy, float* value,
                  bool probabilities) const;

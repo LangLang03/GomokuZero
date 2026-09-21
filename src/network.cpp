@@ -376,10 +376,83 @@ PureNet::TrainStats PureNet::train_step(
 }
 
 bool PureNet::load_native(const std::string& dir) {
-    // The on-disk form is batch normalisation folded into the convolution,
-    // which is exactly what the native forward pass consumes. Loading it into
-    // the folded buffers keeps this path independent of the raw BN tensors,
-    // which are never written to disk.
+    // Two on-disk forms are accepted.
+    //
+    //   Inference export (no training.meta): batch normalisation is already
+    //   folded into the convolution, which is directly what the native forward
+    //   pass consumes.
+    //
+    //   Training checkpoint (training.meta present): the convolution keeps its
+    //   own weights and the batch norm keeps gamma/beta/running statistics
+    //   separately, because folding destroys the parameterisation. The folded
+    //   buffers are then rebuilt from those raw tensors.
+    const bool training_format = has_training_state(dir);
+
+    auto conv_slots = [&](size_t index) -> std::pair<ConvBlock*, FoldedConv*> {
+        if (index == 0) return {&stem_, &stem_folded_};
+        const size_t block = (index - 1) / 2;
+        const bool second = ((index - 1) % 2) == 1;
+        if (block >= trunk_.size()) return {nullptr, nullptr};
+        return second ? std::make_pair(&trunk_[block]->b, &trunk_b_folded_[block])
+                      : std::make_pair(&trunk_[block]->a, &trunk_a_folded_[block]);
+    };
+
+    if (training_format) {
+        auto read_conv_raw = [&](size_t index, const std::string& prefix) {
+            auto [block, folded] = conv_slots(index);
+            if (block == nullptr) return false;
+            ConvLayer& conv = block->conv;
+            const size_t weights = static_cast<size_t>(conv.out_ch) * conv.in_ch *
+                                   conv.kh * conv.kw;
+            const size_t channels = static_cast<size_t>(conv.out_ch);
+            return read_bin_file(dir + "/" + prefix + "weight.bin", conv.w,
+                                 weights) &&
+                   read_bin_file(dir + "/" + prefix + "bias.bin", conv.b,
+                                 channels) &&
+                   read_bin_file(dir + "/" + prefix + "bn_gamma.bin",
+                                 block->bn_gamma, channels) &&
+                   read_bin_file(dir + "/" + prefix + "bn_beta.bin",
+                                 block->bn_beta, channels) &&
+                   read_bin_file(dir + "/" + prefix + "bn_mean.bin",
+                                 block->bn_mean, channels) &&
+                   read_bin_file(dir + "/" + prefix + "bn_var.bin",
+                                 block->bn_var, channels) &&
+                   (conv.gw.assign(weights, 0.0f), true) &&
+                   (conv.gb.assign(channels, 0.0f), true) &&
+                   (folded != nullptr);
+        };
+        size_t index = 0;
+        if (!read_conv_raw(index++, "training_conv0_")) return false;
+        for (size_t i = 0; i < trunk_.size(); ++i) {
+            if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
+                return false;
+            if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
+                return false;
+        }
+        if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
+            return false;
+        if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
+            return false;
+
+        auto read_fc_raw = [&](size_t fc_index, FCLayer& layer) {
+            const std::string prefix =
+                "training_fc" + std::to_string(fc_index) + "_";
+            return read_bin_file(dir + "/" + prefix + "weight.bin", layer.w,
+                                 static_cast<size_t>(layer.out_n) * layer.in_n) &&
+                   read_bin_file(dir + "/" + prefix + "bias.bin", layer.b,
+                                 static_cast<size_t>(layer.out_n));
+        };
+        if (!read_fc_raw(0, policy_fc_)) return false;
+        if (!read_fc_raw(1, value_fc1_)) return false;
+        if (!read_fc_raw(2, value_fc2_)) return false;
+
+        // Rebuild the folded buffers from the raw tensors, which is also what
+        // keeps the native forward pass correct for a later --cpu switch.
+        rebuild_folded_weights();
+        loaded_ = true;
+        return true;
+    }
+
     auto read_folded = [&](const std::string& name, FoldedConv& folded,
                            ConvLayer& conv) {
         const size_t weights = static_cast<size_t>(conv.out_ch) * conv.in_ch *
@@ -435,32 +508,37 @@ bool PureNet::load_native(const std::string& dir) {
 }
 
 bool PureNet::load(const std::string& dir) {
-    // With CUDA present the LibTorch module is the authority: it loads the
-    // folded tensors and then mirrors them into the native buffers so a
-    // --cpu switch stays numerically consistent.
-    // The native buffers are always populated so a later --cpu switch has
-    // valid weights, then LibTorch takes over as the authority.
-    if (!load_native(dir)) return false;
-    last_load_dir_ = dir;
-    if (cuda_enabled_) {
-        if (!cuda_backend_->load(dir)) return false;
-        std::fprintf(stderr, "[net] loaded %zu parameters from %s (CUDA)\n",
-                     parameter_count(), dir.c_str());
+    // Training checkpoints carry the raw batch-norm parameterisation, so the
+    // hook that generated them is also the one that can consume them.
+    if (has_training_state(dir)) {
+        int batches = 0;
+        if (!load_training_state(dir, &batches)) return false;
+        last_load_dir_ = dir;
+        std::fprintf(stderr, "[net] resumed training state from %s (batch %d)\n",
+                     dir.c_str(), batches);
         return true;
     }
 
+    // Native buffers are always populated first so a later --cpu switch has
+    // valid weights; the LibTorch module then becomes the authority.
     if (!load_native(dir)) return false;
     last_load_dir_ = dir;
     loaded_ = true;
-    if (cuda_enabled_) cuda_backend_->sync_from_cpu();
-    std::fprintf(stderr, "[net] loaded %zu parameters from %s\n",
-                 parameter_count(), dir.c_str());
+    if (cuda_enabled_ && !cuda_backend_->load(dir)) return false;
+    std::fprintf(stderr, "[net] loaded %zu parameters from %s%s\n",
+                 parameter_count(), dir.c_str(),
+                 cuda_enabled_ ? " (CUDA)" : "");
     return true;
 }
 
-bool PureNet::save(const std::string& dir) const {
+bool PureNet::has_training_state(const std::string& dir) const {
+    std::ifstream meta(dir + "/training.meta");
+    return meta.is_open();
+}
+
+bool PureNet::export_inference(const std::string& dir) const {
     if (cuda_enabled_) return cuda_backend_->save(dir);
-    // Write the folded form, matching what load() and the CUDA backend read.
+    // Native side: the folded buffers are already the inference form.
     auto write_folded = [&](const std::string& name, const FoldedConv& folded) {
         return write_bin_file(dir + "/" + name + "_weight.bin", folded.w) &&
                write_bin_file(dir + "/" + name + "_bias.bin", folded.b);
@@ -469,7 +547,6 @@ bool PureNet::save(const std::string& dir) const {
         return write_bin_file(dir + "/" + name + "_weight.bin", layer.w) &&
                write_bin_file(dir + "/" + name + "_bias.bin", layer.b);
     };
-
     if (!write_folded("stem", stem_folded_)) return false;
     for (size_t i = 0; i < trunk_.size(); ++i) {
         const std::string base = "res" + std::to_string(i);
@@ -481,6 +558,33 @@ bool PureNet::save(const std::string& dir) const {
     if (!write_fc("act_fc1", policy_fc_)) return false;
     if (!write_fc("val_fc1", value_fc1_)) return false;
     if (!write_fc("val_fc2", value_fc2_)) return false;
+    return true;
+}
+
+bool PureNet::save_training_state(const std::string& dir,
+                                  int batch_index) const {
+    // Only the LibTorch backend trains, and its optimiser holds the moments, so
+    // it owns the checkpoint. The native side has no training state to lose.
+    if (cuda_enabled_)
+        return cuda_backend_->save_training_state(dir, batch_index, 0, {}, {});
+    return export_inference(dir);
+}
+
+bool PureNet::load_training_state(const std::string& dir,
+                                  int* batch_index_out) {
+    int batches = 0;
+    if (cuda_enabled_) {
+        if (!cuda_backend_->load_training_state(dir, &batches, nullptr, nullptr,
+                                                nullptr))
+            return false;
+    } else if (!load_native(dir)) {
+        return false;
+    }
+    // The checkpoint also carries the folded inference export, so the native
+    // buffers stay valid for a --cpu switch.
+    load_native(dir);
+    resume_batch_index_ = batches;
+    if (batch_index_out != nullptr) *batch_index_out = batches;
     return true;
 }
 
@@ -535,12 +639,6 @@ void PureNet::set_cuda_enabled(bool enabled) {
         cuda_backend_->sync_from_cpu();
         cuda_enabled_ = true;
     }
-}
-
-void PureNet::register_all_params() {
-    // The LibTorch backend owns its own parameters; the native Adam is kept
-    // only so weight decay and the learning rate have a single home.
-    adam_registered_ = true;
 }
 
 }  // namespace gomoku

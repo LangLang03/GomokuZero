@@ -236,6 +236,9 @@ struct CudaNetworkBackend::Impl {
     torch::Device device{torch::kCPU};
     std::unique_ptr<torch::optim::Adam> optimizer;
     bool available = false;
+    // Set once any optimisation step has run, so a backend switch that would
+    // discard training state can be refused rather than silently corrupting.
+    bool trained = false;
 };
 
 CudaNetworkBackend::CudaNetworkBackend(PureNet& owner, double learning_rate)
@@ -256,24 +259,43 @@ void CudaNetworkBackend::sync_to_cpu() {
     if (!impl_->available) return;
     PureNet& owner = impl_->owner;
 
-    // Export through the same files the native loader reads. save()/load()
-    // are covered by the round-trip part of the parity test, whereas copying
-    // individual tensors requires keeping two different layouts in sync by
-    // hand.
+    // Export the raw parameterisation (convolution weights plus batch-norm
+    // gamma/beta/running statistics) and let the native loader fold it. Going
+    // through the same checkpoint format the trainer writes keeps one code
+    // path responsible for the conversion.
     namespace fs = std::filesystem;
     std::error_code error;
     const fs::path staging =
         fs::temp_directory_path(error) / "gomoku_cuda_to_cpu";
     if (error) return;
-    if (!save(staging.string())) return;
+    if (!save_training_state(staging.string(), 0, 0, {}, {})) return;
     if (owner.load_native(staging.string())) owner.loaded_ = true;
     fs::remove_all(staging, error);
 }
 
 void CudaNetworkBackend::sync_from_cpu() {
     if (!impl_->available) return;
-    // The native side only ever holds folded weights for inference, so there
-    // is nothing meaningful to push back into the trainable parameters.
+    PureNet& owner = impl_->owner;
+
+    // The native side only ever holds folded weights, so fold-then-load is the
+    // only meaningful direction of data flow. Refuse instead of silently
+    // dropping batch-norm statistics and optimiser state.
+    if (impl_->trained) {
+        throw std::logic_error(
+            "cannot switch to CUDA after training: the native side holds only "
+            "folded inference weights, so batch-norm statistics and optimiser "
+            "moments would be lost. Reload the checkpoint and keep one backend "
+            "for the whole run.");
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const fs::path staging =
+        fs::temp_directory_path(error) / "gomoku_cpu_to_cuda";
+    if (error) return;
+    if (!owner.export_inference(staging.string())) return;
+    load(staging.string());
+    fs::remove_all(staging, error);
 }
 
 bool CudaNetworkBackend::load(const std::string& directory) {
@@ -371,6 +393,160 @@ void CudaNetworkBackend::forward(const float* states, int batch, float* policy,
                 static_cast<size_t>(batch) * sizeof(float));
 }
 
+bool CudaNetworkBackend::has_training_state(
+    const std::string& directory) const {
+    std::ifstream meta(directory + "/training.meta");
+    return meta.is_open();
+}
+
+bool CudaNetworkBackend::save_training_state(
+    const std::string& directory, int batch_index, int64_t step,
+    const std::vector<float>& moments_m,
+    const std::vector<float>& moments_v) const {
+    if (!impl_->available) return false;
+    torch::NoGradGuard no_grad;
+    bool ok = true;
+    size_t tensor_index = 0;
+
+    // Raw parameterisation: the convolution keeps its own weights and the
+    // batch norm keeps gamma/beta/running statistics separately. Folding them
+    // is exact for inference but a folded file cannot resume training
+    // faithfully, because it no longer represents the same parameters.
+    impl_->for_each_conv([&](const std::string& name, torch::nn::Conv2d& conv,
+                             torch::nn::BatchNorm2d& bn) {
+        if (!ok) return;
+        const std::string prefix =
+            "training_conv" + std::to_string(tensor_index++) + "_";
+        ok = write_bin(directory + "/" + prefix + "weight.bin",
+                       to_vector(conv->weight)) &&
+             write_bin(directory + "/" + prefix + "bias.bin",
+                       to_vector(conv->bias)) &&
+             write_bin(directory + "/" + prefix + "bn_gamma.bin",
+                       to_vector(bn->weight)) &&
+             write_bin(directory + "/" + prefix + "bn_beta.bin",
+                       to_vector(bn->bias)) &&
+             write_bin(directory + "/" + prefix + "bn_mean.bin",
+                       to_vector(bn->running_mean)) &&
+             write_bin(directory + "/" + prefix + "bn_var.bin",
+                       to_vector(bn->running_var));
+    });
+    size_t fc_index = 0;
+    impl_->for_each_fc([&](const std::string& name, torch::nn::Linear& fc) {
+        if (!ok) return;
+        const std::string prefix =
+            "training_fc" + std::to_string(fc_index++) + "_";
+        ok = write_bin(directory + "/" + prefix + "weight.bin",
+                       to_vector(fc->weight)) &&
+             write_bin(directory + "/" + prefix + "bias.bin",
+                       to_vector(fc->bias));
+    });
+    if (!ok) return false;
+
+    std::ofstream meta(directory + "/training.meta");
+    if (!meta.is_open()) return false;
+    meta << "version 1\n";
+    meta << "batch_index " << batch_index << "\n";
+    meta << "optimizer_step " << step << "\n";
+    meta << "conv_count " << tensor_index << "\n";
+    meta << "fc_count " << fc_index << "\n";
+    meta << "moments_m " << moments_m.size() << "\n";
+    meta << "moments_v " << moments_v.size() << "\n";
+    meta.close();
+    if (!moments_m.empty())
+        ok = write_bin(directory + "/training_moments_m.bin", moments_m);
+    if (ok && !moments_v.empty())
+        ok = write_bin(directory + "/training_moments_v.bin", moments_v);
+    if (!ok) return false;
+
+    // The inference export travels with the checkpoint so MCTS and `human`
+    // can consume the same directory.
+    return save(directory);
+}
+
+bool CudaNetworkBackend::load_training_state(
+    const std::string& directory, int* batch_index, int64_t* step,
+    std::vector<float>* moments_m, std::vector<float>* moments_v) {
+    if (!impl_->available) return false;
+    std::ifstream meta(directory + "/training.meta");
+    if (!meta.is_open()) return false;
+    std::string key;
+    int version = 0, batches = 0, conv_count = 0, fc_count = 0;
+    int64_t optimizer_step = 0;
+    size_t m_size = 0, v_size = 0;
+    meta >> key >> version;
+    if (version != 1) return false;
+    meta >> key >> batches;
+    meta >> key >> optimizer_step;
+    meta >> key >> conv_count;
+    meta >> key >> fc_count;
+    meta >> key >> m_size;
+    meta >> key >> v_size;
+    meta.close();
+
+    torch::NoGradGuard no_grad;
+    bool ok = true;
+    size_t tensor_index = 0;
+    impl_->for_each_conv([&](const std::string& name, torch::nn::Conv2d& conv,
+                             torch::nn::BatchNorm2d& bn) {
+        if (!ok) return;
+        const std::string prefix =
+            "training_conv" + std::to_string(tensor_index++) + "_";
+        auto load_into = [&](torch::Tensor& target,
+                             const std::string& suffix) {
+            std::vector<float> data;
+            if (!read_bin(directory + "/" + prefix + suffix, data,
+                          static_cast<size_t>(target.numel())))
+                return false;
+            target.copy_(torch::from_blob(data.data(), target.sizes(),
+                                          torch::TensorOptions().dtype(
+                                              torch::kFloat32))
+                             .to(impl_->device));
+            return true;
+        };
+        ok = load_into(conv->weight, "weight.bin") &&
+             load_into(conv->bias, "bias.bin") &&
+             load_into(bn->weight, "bn_gamma.bin") &&
+             load_into(bn->bias, "bn_beta.bin") &&
+             load_into(bn->running_mean, "bn_mean.bin") &&
+             load_into(bn->running_var, "bn_var.bin");
+    });
+    size_t fc_index = 0;
+    impl_->for_each_fc([&](const std::string& name, torch::nn::Linear& fc) {
+        if (!ok) return;
+        const std::string prefix =
+            "training_fc" + std::to_string(fc_index++) + "_";
+        auto load_into = [&](torch::Tensor& target,
+                             const std::string& suffix) {
+            std::vector<float> data;
+            if (!read_bin(directory + "/" + prefix + suffix, data,
+                          static_cast<size_t>(target.numel())))
+                return false;
+            target.copy_(torch::from_blob(data.data(), target.sizes(),
+                                          torch::TensorOptions().dtype(
+                                              torch::kFloat32))
+                             .to(impl_->device));
+            return true;
+        };
+        ok = load_into(fc->weight, "weight.bin") &&
+             load_into(fc->bias, "bias.bin");
+    });
+    if (!ok) return false;
+
+    if (batch_index != nullptr) *batch_index = batches;
+    if (step != nullptr) *step = optimizer_step;
+    if (moments_m != nullptr && m_size > 0) {
+        std::vector<float> data;
+        if (read_bin(directory + "/training_moments_m.bin", data, m_size))
+            *moments_m = std::move(data);
+    }
+    if (moments_v != nullptr && v_size > 0) {
+        std::vector<float> data;
+        if (read_bin(directory + "/training_moments_v.bin", data, v_size))
+            *moments_v = std::move(data);
+    }
+    return true;
+}
+
 PureNet::TrainStats CudaNetworkBackend::train_step(
     const std::vector<float>& states, int batch,
     const std::vector<float>& probs, const std::vector<float>& winners,
@@ -406,6 +582,7 @@ PureNet::TrainStats CudaNetworkBackend::train_step(
     if (clip > 0.0)
         torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), clip);
     impl_->optimizer->step();
+    impl_->trained = true;
     const auto entropy = -torch::mean(
         torch::sum(torch::exp(log_policy) * log_policy, 1));
 

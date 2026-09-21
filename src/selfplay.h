@@ -28,6 +28,12 @@ struct SearchConfig {
     // trained as "never play here"; see unseen_move_smooth.
     int max_candidates = 60;
 
+    // Target size of one batched inference call on CUDA. Measured on the
+    // 12-block trunk: 32 gives the best throughput (2846 eval/s) on an
+    // RTX 5060, while 128 -- inherited from the old 3-layer network -- is
+    // about 10% slower. 0 derives the default.
+    int inference_batch_target = 0;
+
     // Virtual loss applied to a node while a playout is in flight. Larger
     // values spread concurrent threads over distinct branches instead of
     // having them collide on the same child and retry.
@@ -55,6 +61,11 @@ struct MatchResult {
         return games > 0 ? (wins + 0.5 * draws) / games : 0.0;
     }
 };
+
+// Single best move for `board`, using the same MCTS as self-play and the
+// arena. Returns -1 when no move is available.
+int search_best_move(PureNet& net, const Board& board,
+                     const SearchConfig& config);
 
 // Plays `games` games of `candidate` versus `opponent`, alternating colours.
 // This is the only measurement that reflects playing strength; validation

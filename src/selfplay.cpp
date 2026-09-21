@@ -462,11 +462,13 @@ BatchedSelfPlay::BatchedSelfPlay(PureNet& net, const SearchConfig& config)
         leaf_batch_size_ = std::max(
             1, std::min(n_playout_, std::atoi(leaf_batch_text)));
     } else if (net_.using_cuda()) {
-        // The 15x15 CUDA network peaks near a total batch of 128.
-        constexpr int CUDA_TARGET_BATCH = 128;
+        // Batch size at which this trunk saturates the GPU. Measured, not
+        // inherited: the previous constant came from the 3-layer network.
+        constexpr int kDefaultCudaBatch = 32;
+        const int target = config_.inference_batch_target > 0
+            ? config_.inference_batch_target : kDefaultCudaBatch;
         leaf_batch_size_ = std::max(1, std::min(
-            n_playout_,
-            (CUDA_TARGET_BATCH + batch_games_ - 1) / batch_games_));
+            n_playout_, (target + batch_games_ - 1) / batch_games_));
     } else {
         leaf_batch_size_ = std::min(n_playout_, 128);
     }
@@ -894,11 +896,24 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
             // that are merely unvisited, which trains the policy to consider
             // them unplayable and removes any chance of MCTS correcting a
             // mis-prioritised branch later.
+            //
+            // The mass goes only to empty cells: spreading it over all 225
+            // cells would assign probability to occupied, illegal moves and
+            // teach the policy to keep mass on them.
             if (config_.unseen_move_smooth > 0.0f) {
-                const float smooth = config_.unseen_move_smooth;
-                const float spread = smooth / static_cast<float>(BOARD_CELLS);
+                int legal_count = 0;
                 for (int m = 0; m < BOARD_CELLS; ++m)
-                    probs[m] = probs[m] * (1.0f - smooth) + spread;
+                    if (game.board.is_empty(m)) ++legal_count;
+                if (legal_count > 0) {
+                    const float smooth = config_.unseen_move_smooth;
+                    const float spread =
+                        smooth / static_cast<float>(legal_count);
+                    for (int m = 0; m < BOARD_CELLS; ++m) {
+                        probs[m] = game.board.is_empty(m)
+                            ? probs[m] * (1.0f - smooth) + spread
+                            : 0.0f;
+                    }
+                }
             }
             std::array<float, 4 * BOARD_CELLS> state{};
             game.board.encode_state(state.data());
@@ -988,7 +1003,11 @@ struct ArenaSearch {
                 backup_path(game, task.path, terminal_value, loss);
                 continue;
             }
-            game.board.encode_state(state.data());
+            // The network must evaluate the leaf position. select_leaf() copies
+            // the root into task.board and then plays the selected actions
+            // along the path, so task.board is the leaf while game.board stays
+            // at the root.
+            task.board.encode_state(state.data());
             net.forward_batch_policy(state.data(), 1, policy.data(), &value);
             CachedEvaluation evaluation;
             evaluation.value = value;
@@ -1015,6 +1034,18 @@ struct ArenaSearch {
 };
 
 }  // namespace
+
+int search_best_move(PureNet& net, const Board& board,
+                     const SearchConfig& config) {
+    ArenaSearch search(config.n_playout, config.max_candidates);
+    // Human play wants the strongest move, not exploration.
+    SearchConfig greedy = config;
+    greedy.dirichlet_eps = 0.0f;
+    greedy.temp_high = 0.0f;
+    greedy.temp_low = 0.0f;
+    const int move = search.run(net, board, greedy);
+    return (move >= 0 && board.is_empty(move)) ? move : -1;
+}
 
 MatchResult play_match(PureNet& candidate, PureNet& opponent,
                        const SearchConfig& config, int games) {

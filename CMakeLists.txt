@@ -188,4 +188,31 @@ if(BUILD_TESTING)
     endif()
     gomok_apply_sanitizer(gomoku_backend_parity)
     add_test(NAME gomoku_backend_parity COMMAND gomoku_backend_parity)
+
+    # Pins the correctness fixes reported against the source.
+    add_executable(gomoku_regression
+        tests/regression.cpp
+        src/game.cpp
+        src/network.cpp
+        src/gradient.cpp
+        src/selfplay.cpp
+        src/logger.cpp
+    )
+    target_include_directories(gomoku_regression PRIVATE src)
+    target_link_libraries(gomoku_regression PRIVATE pthread)
+    if(Torch_FOUND)
+        target_sources(gomoku_regression PRIVATE src/network_cuda.cpp)
+        target_compile_definitions(gomoku_regression PRIVATE GOMOK_HAS_TORCH=1
+                                   _GLIBCXX_USE_CXX11_ABI=1)
+        target_include_directories(gomoku_regression SYSTEM PRIVATE
+            "${GOMOK_TORCH_INCLUDE}"
+            "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
+        target_link_libraries(gomoku_regression PRIVATE "${TORCH_LIBRARIES}")
+        set_property(TARGET gomoku_regression PROPERTY BUILD_RPATH
+                     "${GOMOK_TORCH_LIB}")
+    else()
+        target_sources(gomoku_regression PRIVATE src/network_cuda_stub.cpp)
+    endif()
+    gomok_apply_sanitizer(gomoku_regression)
+    add_test(NAME gomoku_regression COMMAND gomoku_regression)
 endif()

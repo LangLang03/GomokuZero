@@ -1,4 +1,5 @@
 #include "network_cuda.h"
+#include <cstdint>
 #include <stdexcept>
 
 namespace gomoku {
@@ -10,6 +11,19 @@ CudaNetworkBackend::CudaNetworkBackend(PureNet&, double)
 CudaNetworkBackend::~CudaNetworkBackend() = default;
 bool CudaNetworkBackend::available() const { return false; }
 bool CudaNetworkBackend::load(const std::string&) { return false; }
+bool CudaNetworkBackend::has_training_state(const std::string&) const {
+    return false;
+}
+bool CudaNetworkBackend::save_training_state(
+    const std::string&, int, int64_t, const std::vector<float>&,
+    const std::vector<float>&) const {
+    return false;
+}
+bool CudaNetworkBackend::load_training_state(const std::string&, int*,
+                                             int64_t*, std::vector<float>*,
+                                             std::vector<float>*) {
+    return false;
+}
 void CudaNetworkBackend::set_weight_decay(double) {}
 void CudaNetworkBackend::sync_from_cpu() {}
 void CudaNetworkBackend::sync_to_cpu() {}

@@ -9,8 +9,9 @@ and training when a PyTorch wheel is available.
 ## Highlights
 
 - **Pure-C++ core**: forward/backward/Adam written from scratch; links only `pthread`.
-- **Fast CPU inference**: AVX2 conv kernels (register tiling) + int8 quantization
-  using AVX-VNNI dot-product instructions, with runtime CPU dispatch.
+- **Native CPU inference**: residual trunk with batch norm folded into the
+  convolutions, so MCTS still runs without CUDA and the two forward
+  implementations can be checked against each other.
 - **Lock-free MCTS**: arena-allocated nodes, cache-line-aligned atomics, virtual
   loss, and an evaluation cache (≈30% of playouts skip the network).
 - **Batched self-play**: leaf tasks from multiple games are merged into large
@@ -55,10 +56,7 @@ GOMOK_MCTS_THREADS=8 ./build/gomoku_train train \
     --init best_policy_cpp_bin --games 79 --playout 400 --batch-games 64 \
     --check-freq 10 --threads 8
 
-# Same run on CPU; INT8 inference requires AVX-VNNI
-GOMOK_MCTS_THREADS=8 ./build/gomoku_train train \
-    --init best_policy_cpp_bin --games 79 --playout 400 --batch-games 64 \
-    --check-freq 10 --threads 8 --int8 --cpu
+# Native CPU path: inference only, training needs the LibTorch backend
 
 # Self-play throughput benchmark
 GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
@@ -86,7 +84,6 @@ would produce 320,000 games.
 | `--buffer N` | 10000 | replay-buffer capacity |
 | `--check-freq N` | 50 | checkpoint interval in batches |
 | `--threads N` | auto, max 8 | CPU inference workers |
-| `--int8` | off | AVX-VNNI inference; CPU only |
 | `--cpu` | off | disable CUDA even when available |
 | `--mix PREFIX` | none | optional external training data |
 | `--mix-ratio R` | 0.5 | external-data fraction per optimizer batch |
@@ -196,25 +193,45 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train train \
     --batch-size 512 --epochs 5 --check-freq 10 --threads 8 \
     --tag bench_cuda
 
-# CPU
-GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train train \
-    --init best_policy_cpp_bin --games 1 --playout 400 --batch-games 64 \
-    --batch-size 512 --epochs 5 --check-freq 10 --threads 8 \
-    --int8 --cpu --tag bench_cpu
+# Native CPU path: inference only
+GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
+    --model best_policy_cpp_bin --playout 400 --games 64 --batch 64 \
+    --threads 8 --cpu
 ```
 
 The reported wall time includes process startup, self-play, five optimizer
 steps and the final checkpoint save.
 
+> **The table below is the old 3-layer network (325,964 parameters) and is
+> kept only as a historical reference.** The current 12-block residual trunk
+> (8,100,525 parameters) is substantially slower; measured numbers follow.
+
 | Backend | Wall time | Network evals | Samples | Inference batches |
 |---|---:|---:|---:|---:|
-| RTX 5060 CUDA FP32/TF32 | **8.34 s** | 884,039 | 3,001 | 9,053 (avg 97.7, max 128) |
-| CPU INT8 self-play + FP32 training | **55.17 s** | 919,553 | 3,087 | 1,237 (avg 743.4) |
+| ~~RTX 5060 CUDA FP32/TF32~~ | ~~8.34 s~~ | 884,039 | 3,001 | 9,053 (avg 97.7, max 128) |
+| ~~CPU INT8 self-play + FP32 training~~ | ~~55.17 s~~ | 919,553 | 3,087 | 1,237 (avg 743.4) |
 
-CUDA is about 6.6x faster end to end in this run. A two-batch CUDA run took
-14.19 s total; its second, warmed-up batch took 5.8 s. Based on those runs,
-79 batches (5,056 games) are expected to take roughly **9–11 minutes on CUDA**
-or **70–80 minutes on CPU**.
+### Current architecture (RTX 5060 Laptop)
+
+```
+GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
+    --model <ckpt> --playout 400 --games 32 --batch 32 --threads 8
+```
+
+| Metric | Value |
+|---|---:|
+| Wall time | 233.6 s for 32 games |
+| Per game | 7.30 s (46.7 moves/game) |
+| Network evals | 501,216 |
+| Inference calls | 4,468 (avg batch 112.2, max 128) |
+| Evaluation cache hits | 69,757 (13.9%) |
+
+Extrapolating, 79 batches x 64 games (~5,056 games) takes roughly **4-6 hours
+on CUDA**. That is an order of magnitude slower than the old network, which is
+the direct cost of going from 326k to 8.1M parameters.
+
+Cache hits rose from 10.3% to 13.9%: correcting the virtual loss means fewer
+playouts are wasted on retries and more land on already-evaluated nodes.
 
 Game length changes the amount of work substantially, even with the same
 playout count. Compare `evals`, `samples`, and `moves/game` when evaluating two

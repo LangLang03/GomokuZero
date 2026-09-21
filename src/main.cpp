@@ -27,6 +27,7 @@ static void print_usage() {
         "         [--temp-switch 30] [--dirichlet-eps 0.25]\n"
         "         [--dirichlet-alpha 0.3] [--max-candidates 60]\n"
         "         [--virtual-loss 3.0] [--unseen-smooth 0.05]\n"
+        "         [--inference-batch 32]\n"
         "  selfplay --model <bin_dir> --playout N --games N [--batch N]\n"
         "         [--threads N] [--cpu] (CUDA is automatic)\n"
         "         (benchmark self-play throughput)\n"
@@ -86,6 +87,7 @@ int cmd_train(int argc, char** argv) {
         else if (a == "--dirichlet-alpha") { search.dirichlet_alpha = next_float(); }
         else if (a == "--max-candidates") { search.max_candidates = next_int(); }
         else if (a == "--virtual-loss") { search.virtual_loss = next_float(); }
+        else if (a == "--inference-batch") { search.inference_batch_target = next_int(); }
         else if (a == "--unseen-smooth") { search.unseen_move_smooth = next_float(); }
         else {
             std::cerr << "unknown option: " << a << "\n";
@@ -154,39 +156,43 @@ int cmd_selfplay(int argc, char** argv) {
 int cmd_human(int argc, char** argv) {
     std::string model;
     bool force_cpu = false;
+    SearchConfig search;
+    search.n_playout = 400;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--model") { if (i+1<argc) model = argv[++i]; }
+        else if (a == "--playout") { if (i+1<argc) search.n_playout = std::stoi(argv[++i]); }
+        else if (a == "--c-puct") { if (i+1<argc) search.c_puct = std::stof(argv[++i]); }
+        else if (a == "--max-candidates") { if (i+1<argc) search.max_candidates = std::stoi(argv[++i]); }
         else if (a == "--cpu") { force_cpu = true; }
     }
+    search.n_threads = 1;
     PureNet net(2e-3);
     net.set_cuda_enabled(!force_cpu);
     if (!net.load(model)) return 1;
 
     Board board;
-    std::cout << "five-in-a-row vs AI. enter 'r,c' (0-14). AI is white.\n";
+    std::cout << "five-in-a-row vs AI (" << search.n_playout
+              << " MCTS playouts). enter 'r,c' (0-14). AI is white.\n";
     while (true) {
-        int r, c;
+        int r = 0, c = 0;
         std::cout << "your move: ";
         std::string line;
         if (!std::getline(std::cin, line)) break;
         if (sscanf(line.c_str(), "%d,%d", &r, &c) != 2) continue;
-        int move = r * BOARD_SIZE + c;
+        const int move = r * BOARD_SIZE + c;
         if (move < 0 || move >= BOARD_CELLS || !board.is_empty(move)) continue;
         board.play(move);
         if (board.winner()) { std::cout << "you win!\n"; break; }
+        if (board.move_count() == BOARD_CELLS) { std::cout << "draw\n"; break; }
 
-        std::vector<float> state(4 * BOARD_CELLS);
-        board.encode_state(state.data());
-        std::vector<float> lp;
-        float val;
-        net.forward_one(state, lp, val);
-        float best = -1e9f; int bestm = -1;
-        for (int m = 0; m < BOARD_CELLS; ++m)
-            if (board.is_empty(m) && lp[m] > best) { best = lp[m]; bestm = m; }
+        // MCTS, not the bare policy: the raw policy head is much weaker, so
+        // playing it would misrepresent the engine and ignore --playout.
+        const int bestm = search_best_move(net, board, search);
+        if (bestm < 0) { std::cout << "no move available; draw\n"; break; }
         board.play(bestm);
         std::cout << "AI plays " << bestm / BOARD_SIZE << ","
-                  << bestm % BOARD_SIZE << " (value " << val << ")\n";
+                  << bestm % BOARD_SIZE << "\n";
         if (board.winner()) { std::cout << "AI wins\n"; break; }
         if (board.move_count() == BOARD_CELLS) { std::cout << "draw\n"; break; }
     }

@@ -72,6 +72,19 @@ public:
         }
     }
 
+    // Momentum export/import, so a training checkpoint can resume with the
+    // optimiser state intact.
+    int step_count() const { return step_; }
+    void set_step_count(int step) { step_ = step; }
+    const std::vector<std::vector<float>>& moments_m() const { return m_; }
+    const std::vector<std::vector<float>>& moments_v() const { return v_; }
+    void restore_state(int step, std::vector<std::vector<float>> m,
+                       std::vector<std::vector<float>> v) {
+        step_ = step;
+        m_ = std::move(m);
+        v_ = std::move(v);
+    }
+
     void set_lr(double lr) { lr_ = lr; }
     double lr() const { return lr_; }
     void set_weight_decay(double weight_decay) { weight_decay_ = weight_decay; }

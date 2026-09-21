@@ -33,7 +33,18 @@ public:
     // Reads the tensor set under dir, or returns false if it is missing or
     // belongs to a different architecture.
     bool load(const std::string& dir);
-    bool save(const std::string& dir) const;
+
+    // Inference export: batch-normalisation folded into the convolutions.
+    // This is what MCTS, `human` and deployment read.
+    bool export_inference(const std::string& dir) const;
+
+    // Training checkpoint: raw convolution weights, batch-norm gamma/beta and
+    // running statistics, dense layers, optimiser moments and the batch index.
+    // Folding is exact for inference but destroys the parameterisation, so a
+    // folded-only file cannot resume training faithfully.
+    bool save_training_state(const std::string& dir, int batch_index) const;
+    bool load_training_state(const std::string& dir, int* batch_index_out);
+    bool has_training_state(const std::string& dir) const;
 
     struct TrainStats { float loss, entropy, policy_loss, value_loss; };
 
@@ -61,6 +72,9 @@ public:
     void set_inference_threads(int threads);
     int inference_threads() const { return inference_threads_; }
 
+    // Last batch index from a training checkpoint, or 0.
+    int resume_batch_index() const { return resume_batch_index_; }
+
     // Optimiser settings, mirrored into the LibTorch optimiser so the
     // objective does not depend on the backend.
     void set_weight_decay(double weight_decay);
@@ -71,9 +85,6 @@ public:
     bool using_cuda() const { return cuda_enabled_; }
     bool cuda_available() const;
     void set_cuda_enabled(bool enabled);
-
-    // Idempotent.
-    void register_all_params();
 
     // Parameter count, for logging and tests.
     size_t parameter_count() const;
@@ -121,10 +132,10 @@ private:
 
     Adam adam_;
     bool loaded_ = false;
-    bool adam_registered_ = false;
     // Remembered so switching to the native CPU path can re-read the same
     // checkpoint instead of trying to mirror live CUDA tensors.
     std::string last_load_dir_;
+    int resume_batch_index_ = 0;
     int inference_threads_ = 1;
     double grad_clip_ = 2.0;
     std::unique_ptr<CudaNetworkBackend> cuda_backend_;

@@ -7,7 +7,7 @@ LibTorch/CUDA 后端加速推理与训练。
 ## 特性
 
 - **纯 C++ 核心**：前向/反向/Adam 全部手写，只链接 `pthread`。
-- **CPU 推理快**：AVX2 卷积（寄存器分块）+ int8 量化（AVX-VNNI 点积指令），运行时检测 CPU 指令集。
+- **CPU 推理可用**：原生前向（批归一化折合进卷积 + 残差），无 CUDA 时仍可对弈，并与 LibTorch 前向做数值对照。
 - **无锁 MCTS**：竞技场分配节点、缓存行对齐原子操作、虚拟损失、评估缓存（约 30% 的 playout 跳过网络）。
 - **批量自对弈**：多局叶子任务合并成大 batch 推理（`GOMOK_BATCH_WAIT_US` 控制等待上界）。
 - **可选 CUDA**：自动探测 PyTorch，批量推理 + autograd 训练 + TF32；`--cpu` 强制走 CPU。
@@ -48,10 +48,7 @@ GOMOK_MCTS_THREADS=8 ./build/gomoku_train train \
     --init best_policy_cpp_bin --games 79 --playout 400 --batch-games 64 \
     --check-freq 10 --threads 8
 
-# 同上，纯 CPU；INT8 推理需要 AVX-VNNI
-GOMOK_MCTS_THREADS=8 ./build/gomoku_train train \
-    --init best_policy_cpp_bin --games 79 --playout 400 --batch-games 64 \
-    --check-freq 10 --threads 8 --int8 --cpu
+# 同上，纯 CPU（只做推理；训练需要 LibTorch 后端）
 
 # 自对弈吞吐基准
 GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
@@ -69,8 +66,8 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
 程序会生成 32 万局。
 
 | 参数 | 默认值 | 含义 |
-|---|---:|---|
-| `--init DIR` | 随机初始化 | 初始16文件模型目录 |
+|---|---|---:|---|
+| `--init DIR` | 随机初始化 | 初始模型目录（旧 3 层检查点不兼容） |
 | `--games N` | 1000 | 自对弈/训练批次数 |
 | `--playout N` | 400 | 每手棋的 MCTS 模拟次数 |
 | `--batch-games N` | 64 | 每批同时进行的对局数 |
@@ -78,12 +75,53 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
 | `--epochs N` | 5 | 每批自对弈后的优化次数 |
 | `--buffer N` | 10000 | 经验回放容量 |
 | `--check-freq N` | 50 | 每隔多少批保存检查点 |
-| `--threads N` | 自动，最多8 | CPU 推理 worker 数量 |
-| `--int8` | 关闭 | AVX-VNNI 推理，仅 CPU |
-| `--cpu` | 关闭 | 即使有 CUDA 也强制使用 CPU |
+| `--threads N` | 自动，最多8 | 推理 worker 数量 |
+| `--cpu` | 关闭 | 强制走原生 CPU 路径（**仅推理**，无法训练） |
 | `--mix PREFIX` | 无 | 可选外部训练数据 |
 | `--mix-ratio R` | 0.5 | 每批优化中外部数据比例 |
+| `--label-smooth F` | 0.1 | 人类棋谱 one-hot 目标的标签平滑量 |
 | `--tag NAME` | `cpp` | 输出目录后缀：`best_policy_<tag>_bin` |
+
+**学习率**（替代原先基于伪 KL 的反馈控制）：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--lr F` | 2e-3 | 基础学习率 |
+| `--lr-warmup N` | 2 | 线性预热批次数 |
+| `--lr-final-fraction F` | 0.1 | 余弦衰减终点（× `--lr`） |
+| `--weight-decay F` | 1e-4 | L2 正则（CPU/CUDA 统一） |
+| `--grad-clip F` | 2.0 | 梯度范数裁剪上限 |
+
+**自对弈与搜索**：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--c-puct F` | 5.0 | PUCT 探索常数 |
+| `--temp-high F` / `--temp-low F` | 1.0 / 0.5 | 温度调度两端 |
+| `--temp-switch N` | 30 | 第 N 手起切换到低温 |
+| `--dirichlet-eps F` | 0.25 | 根节点 Dirichlet 噪声强度（0 关闭） |
+| `--dirichlet-alpha F` | 0.3 | 根节点 Dirichlet 浓度 |
+| `--max-candidates N` | 60 | 每节点最大扩展子节点数 |
+| `--virtual-loss F` | 3.0 | 虚拟损失强度（并发线程分散度） |
+| `--unseen-smooth F` | 0.05 | 留给"未访问合法着法"的概率质量 |
+| `--augment 0\|1` | 1 | 棋盘 8 重对称数据增强 |
+
+**棋力评估**（唯一反映强弱的指标）：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--eval-games N` | 0（关闭） | 每轮评估对局数 |
+| `--eval-freq N` | 50 | 每隔多少批评估一次 |
+| `--eval-playout N` | 30 | 评估时的 MCTS 模拟次数 |
+| `--baseline DIR` | 无 | 对手检查点目录 |
+
+> 注意：评估是**逐局面**推理（batch=1），实测每次前向约 140 ms，
+> 比批量推理慢约 150 倍。请把 `--eval-games` / `--eval-playout` 保持在
+> 较小值；日志会打印本轮评估实际耗时。
+
+`--int8` 已随新架构移除（AVX-VNNI 量化路径与新主干不兼容），
+传入会给出提示并被忽略。
+
 
 ### 环境变量
 
@@ -197,23 +235,42 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train train \
     --batch-size 512 --epochs 5 --check-freq 10 --threads 8 \
     --tag bench_cuda
 
-# CPU
-GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train train \
-    --init best_policy_cpp_bin --games 1 --playout 400 --batch-games 64 \
-    --batch-size 512 --epochs 5 --check-freq 10 --threads 8 \
-    --int8 --cpu --tag bench_cpu
+# 纯 CPU 只保留推理路径
+GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
+    --model best_policy_cpp_bin --playout 400 --games 64 --batch 64 \
+    --threads 8 --cpu
 ```
 
 墙钟时间包含进程启动、自对弈、5次参数优化和最终模型保存。
 
+> **注意：下表是旧 3 层网络（325,964 参数）的数据，仅作历史参考。**
+> 当前 12 层残差主干（8,100,525 参数）慢得多，见下方实测。
+
 | 后端 | 墙钟时间 | 网络评估数 | 样本数 | 推理 batch |
 |---|---:|---:|---:|---:|
-| RTX 5060 CUDA FP32/TF32 | **8.34秒** | 884,039 | 3,001 | 9,053次（平均97.7，最大128） |
-| CPU INT8自对弈 + FP32训练 | **55.17秒** | 919,553 | 3,087 | 1,237次（平均743.4） |
+| ~~RTX 5060 CUDA FP32/TF32~~ | ~~8.34秒~~ | 884,039 | 3,001 | 9,053次（平均97.7，最大128） |
+| ~~CPU INT8自对弈 + FP32训练~~ | ~~55.17秒~~ | 919,553 | 3,087 | 1,237次（平均743.4） |
 
-本轮 GPU 端到端约快6.6倍。连续运行2批时总墙钟为14.19秒，其中完成预热后的
-第二批为5.8秒。根据这些结果，79批（5056局）预计 CUDA 需要约
-**9～11分钟**，CPU 约 **70～80分钟**。
+### 当前架构实测（RTX 5060 Laptop）
+
+```
+GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
+    --model <ckpt> --playout 400 --games 32 --batch 32 --threads 8
+```
+
+| 指标 | 数值 |
+|---|---:|
+| 墙钟 | 233.6 秒（32 局） |
+| 每局 | 7.30 秒（46.7 手/局） |
+| 网络评估数 | 501,216 |
+| 推理调用 | 4,468 次（平均 batch 112.2，最大 128） |
+| 评估缓存命中 | 69,757（13.9%） |
+
+按此推算，79 批 × 64 局（约 5,056 局）在 CUDA 上约需 **4～6 小时**。
+比旧网络慢一个数量级，这是把参数量从 32.6 万提到 810 万的直接代价。
+
+评估缓存命中率从旧架构的 10.3% 提升到 13.9%（虚拟损失修正减少了
+无效重试，更多 playout 落在已评估节点上）。
 
 即使 playout 相同，平均局长不同也会显著改变总工作量。比较两个版本时应同时观察
 `evals`、`samples` 和 `moves/game`，不能只比较总秒数。

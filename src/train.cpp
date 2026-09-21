@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 
 namespace gomoku {
 
@@ -52,18 +54,35 @@ void transform_state(const float* src, float* dst, int t) {
     }
 }
 
-// Blends `epsilon` of uniform mass into a target distribution.
-void apply_label_smoothing(std::vector<float>& probs, float epsilon) {
-    if (epsilon <= 0.0f) return;
+// Blends `epsilon` of mass into a one-hot target, spread over the legal
+// (empty) cells only.
+//
+// Spreading over all 225 cells would put probability on occupied, illegal
+// moves. The shared state planes identify occupancy: channels 0 and 1 hold
+// the two sides' stones.
+void apply_label_smoothing(std::vector<float>& probs, const float* state,
+                           float epsilon) {
+    if (epsilon <= 0.0f || state == nullptr) return;
     const size_t n = probs.size();
     if (n == 0) return;
-    const float spread = epsilon / static_cast<float>(n);
+
+    int legal_count = 0;
+    for (size_t cell = 0; cell < n; ++cell) {
+        const bool occupied = state[cell] > 0.0f || state[n + cell] > 0.0f;
+        if (!occupied) ++legal_count;
+    }
+    if (legal_count == 0) return;
+
+    const float spread = epsilon / static_cast<float>(legal_count);
     const float keep = 1.0f - epsilon;
-    for (float& p : probs) p = p * keep + spread;
+    for (size_t cell = 0; cell < n; ++cell) {
+        const bool occupied = state[cell] > 0.0f || state[n + cell] > 0.0f;
+        probs[cell] = occupied ? 0.0f : probs[cell] * keep + spread;
+    }
 }
 
-double policy_kl(const std::vector<float>& log_p, const std::vector<float>& log_q,
-                 std::vector<float>& scratch, int probes) {
+double policy_kl(const std::vector<float>& log_p,
+                 const std::vector<float>& log_q, int probes) {
     double total = 0.0;
     for (int i = 0; i < probes; ++i) {
         const float* lp = log_p.data() + static_cast<size_t>(i) * BOARD_CELLS;
@@ -73,7 +92,6 @@ double policy_kl(const std::vector<float>& log_p, const std::vector<float>& log_
             row += static_cast<double>(std::exp(lp[k])) * (lp[k] - lq[k]);
         total += row;
     }
-    (void)scratch;
     return probes > 0 ? total / probes : 0.0;
 }
 
@@ -152,7 +170,9 @@ void Trainer::load_mix_data() {
         std::vector<float> row(
             mix_probs_.begin() + static_cast<size_t>(i) * BOARD_CELLS,
             mix_probs_.begin() + static_cast<size_t>(i + 1) * BOARD_CELLS);
-        apply_label_smoothing(row, config_.label_smooth);
+        apply_label_smoothing(
+            row, &mix_states_[static_cast<size_t>(i) * per_state],
+            config_.label_smooth);
         std::copy(row.begin(), row.end(),
                   mix_probs_.begin() + static_cast<size_t>(i) * BOARD_CELLS);
     }
@@ -271,44 +291,28 @@ void Trainer::policy_update(int batch_index) {
                                 config_.value_loss_weight);
     logger.log("batch %d loss:%.6f entropy:%.6f lr:%.6f", batch_index + 1,
                stats.loss, stats.entropy, lr);
+
+    // Capture the post-update policy so the KL diagnostic is a pure
+    // observation. train_step() inside the probe would add an optimisation
+    // step, advance Adam's moments and shift the BN statistics.
+    if (n_kl_ > 0) {
+        std::vector<float> value(static_cast<size_t>(n_kl_));
+        kl_after_.assign(static_cast<size_t>(n_kl_) * BOARD_CELLS, 0.0f);
+        net_.forward_batch(kl_states_.data(), n_kl_, kl_after_.data(),
+                           value.data());
+    }
 }
 
-void Trainer::log_true_kl(int batch_index) {
-    if (n_kl_ <= 0 || n_mix_ <= 0) return;
-    const size_t per_state = 4 * BOARD_CELLS, per_prob = BOARD_CELLS;
-    const int probes = std::min<int>(n_kl_, 128);
-    std::vector<float> states(static_cast<size_t>(probes) * per_state);
-    std::vector<float> probs(static_cast<size_t>(probes) * per_prob);
-    std::vector<float> winners(probes, 0.0f);
-    std::vector<int64_t> order(static_cast<size_t>(n_mix_));
-    for (int64_t i = 0; i < n_mix_; ++i) order[static_cast<size_t>(i)] = i;
-    std::mt19937 rng(0x5bd1e995U ^ static_cast<uint32_t>(batch_index));
-    std::shuffle(order.begin(), order.end(), rng);
-    for (int i = 0; i < probes; ++i) {
-        const int64_t src = order[static_cast<size_t>(i)];
-        std::memcpy(&states[static_cast<size_t>(i) * per_state],
-                    &mix_states_[static_cast<size_t>(src) * per_state],
-                    per_state * sizeof(float));
-        std::memcpy(&probs[static_cast<size_t>(i) * per_prob],
-                    &mix_probs_[static_cast<size_t>(src) * per_prob],
-                    per_prob * sizeof(float));
-        winners[i] = mix_winners_[static_cast<size_t>(src)];
-    }
+void Trainer::update_kl_probe() {
+    if (n_kl_ <= 0) return;
+    std::vector<float> value(static_cast<size_t>(n_kl_));
+    net_.forward_batch(kl_states_.data(), n_kl_, kl_before_.data(),
+                       value.data());
+}
 
-    std::vector<float> before(static_cast<size_t>(probes) * BOARD_CELLS);
-    std::vector<float> after(static_cast<size_t>(probes) * BOARD_CELLS);
-    std::vector<float> value(probes);
-    net_.forward_batch(states.data(), probes, before.data(), value.data());
-
-    // One probe-sized step, so the KL measures the movement of the policy
-    // distribution rather than the distance between two identical forwards.
-    const double lr = learning_rate_for_batch(batch_index) * 0.1;
-    net_.train_step(states, probes, probs, winners, lr,
-                    config_.value_loss_weight);
-
-    net_.forward_batch(states.data(), probes, after.data(), value.data());
-    std::vector<float> scratch;
-    const double kl = policy_kl(before, after, scratch, probes);
+void Trainer::log_true_kl(int batch_index) const {
+    if (n_kl_ <= 0 || kl_before_.empty() || kl_after_.empty()) return;
+    const double kl = policy_kl(kl_before_, kl_after_, n_kl_);
     logger.log("batch %d lr:%.6f true_kl:%.6f", batch_index + 1,
                learning_rate_for_batch(batch_index), kl);
 }
@@ -349,10 +353,22 @@ void Trainer::validate(int batch_idx) {
 
 void Trainer::evaluate_and_save(int batch_idx) {
     const std::string dir = "best_policy_" + config_.tag + "_bin";
-    const std::string cmd = "mkdir -p " + dir;
-    (void)system(cmd.c_str());
-    net_.save(dir);
-    logger.log("[train] batch %d model saved (%s)", batch_idx, dir.c_str());
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    if (error) {
+        logger.log("[error] cannot create %s: %s", dir.c_str(),
+                   error.message().c_str());
+        throw std::runtime_error("checkpoint directory is not writable: " + dir);
+    }
+
+    // A full training checkpoint carries the raw batch-norm parameterisation
+    // and the optimiser moments, which a folded inference export cannot
+    // express. It also writes the inference tensors into the same directory.
+    if (!net_.save_training_state(dir, batch_idx)) {
+        logger.log("[error] checkpoint save failed (%s)", dir.c_str());
+        throw std::runtime_error("checkpoint save failed: " + dir);
+    }
+    logger.log("[train] batch %d checkpoint saved (%s)", batch_idx, dir.c_str());
 }
 
 void Trainer::run_arena(int batch_idx) {
@@ -371,11 +387,15 @@ void Trainer::run_arena(int batch_idx) {
 
     SearchConfig arena = search_;
     arena.n_playout = std::max(1, config_.eval_playout);
+    const auto started = std::chrono::steady_clock::now();
     const MatchResult result =
         play_match(net_, baseline, arena, config_.eval_games);
-    logger.log("[arena] batch %d | vs %s | %dW %dL %dD | score %.3f",
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+            .count();
+    logger.log("[arena] batch %d | vs %s | %dW %dL %dD | score %.3f | %.0fs",
                batch_idx, config_.baseline_dir.c_str(), result.wins,
-               result.losses, result.draws, result.score());
+               result.losses, result.draws, result.score(), seconds);
 }
 
 void Trainer::run() {
@@ -390,6 +410,7 @@ void Trainer::run() {
         int n_samples = 0;
         for (auto& g : batches) n_samples += static_cast<int>(g.size());
 
+        update_kl_probe();
         policy_update(i);
         if ((i + 1) % 5 == 0) log_true_kl(i);
 

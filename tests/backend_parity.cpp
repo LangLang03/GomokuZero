@@ -70,7 +70,7 @@ int main() {
     const std::string directory =
         (std::filesystem::temp_directory_path() / "gomoku_parity_model").string();
     std::filesystem::create_directories(directory);
-    CHECK(net.save(directory), "save failed");
+    CHECK(net.export_inference(directory), "inference export failed");
 
     std::mt19937 rng(2024);
     const int batch = 8;
@@ -141,7 +141,7 @@ int main() {
         const std::string round_trip =
             (std::filesystem::temp_directory_path() / "gomoku_parity_rt").string();
         std::filesystem::create_directories(round_trip);
-        CHECK(cuda_net.save(round_trip), "CUDA save failed");
+        CHECK(cuda_net.export_inference(round_trip), "CUDA export failed");
         PureNet cuda_net2;
         CHECK(cuda_net2.load(round_trip), "CUDA reload failed");
         cuda_net2.set_cuda_enabled(true);
