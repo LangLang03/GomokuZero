@@ -26,7 +26,7 @@ static void print_usage() {
         "         [--c-puct 5.0] [--temp-high 1.0] [--temp-low 0.5]\n"
         "         [--temp-switch 30] [--dirichlet-eps 0.25]\n"
         "         [--dirichlet-alpha 0.3] [--max-candidates 60]\n"
-        "         [--virtual-loss 3.0] [--unseen-smooth 0.05]\n"
+        "         [--virtual-loss 8.0] [--unseen-smooth 0.05]\n"
         "         [--inference-batch 32]\n"
         "  selfplay --model <bin_dir> --playout N --games N [--batch N]\n"
         "         [--threads N] [--cpu] (CUDA is automatic)\n"
