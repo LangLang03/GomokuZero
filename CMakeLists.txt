@@ -64,6 +64,18 @@ else()
 endif()
 
 # Applies the configured sanitizer flags to a target.
+# Applies the sanitizer-only network overrides to a target.
+function(gomok_apply_net_shape target)
+    if(GOMOK_SANITIZER_CHANNELS)
+        target_compile_definitions(${target} PRIVATE
+            GOMOK_NET_CHANNELS=${GOMOK_SANITIZER_CHANNELS})
+    endif()
+    if(GOMOK_SANITIZER_RES_BLOCKS)
+        target_compile_definitions(${target} PRIVATE
+            GOMOK_NET_RES_BLOCKS=${GOMOK_SANITIZER_RES_BLOCKS})
+    endif()
+endfunction()
+
 function(gomok_apply_sanitizer target)
     if(NOT GOMOK_SANITIZER_FLAGS)
         return()
@@ -71,6 +83,14 @@ function(gomok_apply_sanitizer target)
     target_compile_options(${target} PRIVATE ${GOMOK_SANITIZER_FLAGS})
     target_link_options(${target} PRIVATE ${GOMOK_SANITIZER_FLAGS})
 endfunction()
+
+# Shrinks the trunk for sanitizer runs. TSan instruments every memory access,
+# so the production 12x192 trunk turns a self-play run into a very long wait;
+# the code under test (MCTS, queues, node arena) does not depend on the shape.
+set(GOMOK_SANITIZER_CHANNELS "" CACHE STRING
+    "Override NetConfig::kChannels (sanitizer builds only)")
+set(GOMOK_SANITIZER_RES_BLOCKS "" CACHE STRING
+    "Override NetConfig::kResBlocks (sanitizer builds only)")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -114,6 +134,7 @@ if(GOMOK_IPO_SUPPORTED)
     set_property(TARGET gomoku_train PROPERTY
                  INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 endif()
+gomok_apply_net_shape(gomoku_train)
 gomok_apply_sanitizer(gomoku_train)
 
 include(CTest)
@@ -144,6 +165,7 @@ if(BUILD_TESTING)
         set_property(TARGET gomoku_smoke PROPERTY
                      INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     endif()
+    gomok_apply_net_shape(gomoku_smoke)
     gomok_apply_sanitizer(gomoku_smoke)
     add_test(NAME gomoku_smoke COMMAND gomoku_smoke)
 
@@ -186,6 +208,7 @@ if(BUILD_TESTING)
     else()
         target_sources(gomoku_backend_parity PRIVATE src/network_cuda_stub.cpp)
     endif()
+    gomok_apply_net_shape(gomoku_backend_parity)
     gomok_apply_sanitizer(gomoku_backend_parity)
     add_test(NAME gomoku_backend_parity COMMAND gomoku_backend_parity)
 
@@ -213,6 +236,7 @@ if(BUILD_TESTING)
     else()
         target_sources(gomoku_regression PRIVATE src/network_cuda_stub.cpp)
     endif()
+    gomok_apply_net_shape(gomoku_regression)
     gomok_apply_sanitizer(gomoku_regression)
     add_test(NAME gomoku_regression COMMAND gomoku_regression)
 endif()

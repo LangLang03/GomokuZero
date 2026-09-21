@@ -20,8 +20,17 @@ struct NetConfig {
     // stem see 2 * (2 * kResBlocks + 1) + 1 cells across. Detecting five in a
     // row needs at least 9x9, and the previous 3-layer trunk only reached
     // 7x7, so long-range threats were structurally invisible.
-    static constexpr int kChannels = 192;
-    static constexpr int kResBlocks = 12;
+    // Sanitizer builds may shrink the trunk. TSan instruments every memory
+    // access, so the full 12x192 trunk makes a self-play run take tens of
+    // minutes; the concurrency logic under test does not depend on the shape.
+#ifndef GOMOK_NET_CHANNELS
+#define GOMOK_NET_CHANNELS 192
+#endif
+#ifndef GOMOK_NET_RES_BLOCKS
+#define GOMOK_NET_RES_BLOCKS 12
+#endif
+    static constexpr int kChannels = GOMOK_NET_CHANNELS;
+    static constexpr int kResBlocks = GOMOK_NET_RES_BLOCKS;
 
     static constexpr int receptive_field() {
         return 2 * (2 * kResBlocks + 1) + 1;

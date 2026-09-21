@@ -105,6 +105,7 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
 | `--virtual-loss F` | 3.0 | 虚拟损失强度（并发线程分散度） |
 | `--unseen-smooth F` | 0.05 | 留给"未访问合法着法"的概率质量 |
 | `--augment 0\|1` | 1 | 棋盘 8 重对称数据增强 |
+| `--inference-batch N` | 32 | CUDA 单次批量推理的目标样本数 |
 
 **棋力评估**（唯一反映强弱的指标）：
 
@@ -135,6 +136,17 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
 | `GOMOK_SEED` | 时钟 | 固定自对弈随机种子 |
 
 ### 模型格式
+
+目录有**两种形式**，由是否存在 `training.meta` 区分：
+
+| 形式 | 内容 | 用途 |
+|---|---|---|
+| **推理导出** | 折合后的 conv weight/bias + 全连接层 | MCTS、`human`、部署、CPU 推理 |
+| **训练 checkpoint** | 原始 conv weight/bias + BN gamma/beta/running stats + 全连接层 + batch 序号 + `training.meta` | 续训 |
+
+折合 BN 对推理是精确等价的仿射改写，但会改变参数化（BN 的四个张量不再存在），
+因此**折合形式无法忠实续训**。`tools/export_onnx.py --bin-dir` 读的是推理形式，
+`gomoku_train` 保存检查点时同时写出两者，`load` 按 `training.meta` 自动识别。
 
 权重按张量存放在目录下（`stem_weight.bin`、`res0_a_weight.bin`、
 `act_fc1_bias.bin` 等），每文件为 `[u32 数量][float32 数据...]`。

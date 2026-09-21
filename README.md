@@ -141,10 +141,17 @@ Why this shape (all measured on the previous checkpoint):
 inference only, so MCTS still works without a GPU and so the two forward
 implementations can be checked against each other.
 
-Weights are stored with batch normalisation folded into the convolution,
-which is exact for inference and is the single on-disk format both backends
-read. Folding is idempotent (`running_var` is loaded as `1 - eps` so the
-fold factor is exactly 1), so repeated save/load cycles do not drift.
+There are two on-disk forms, distinguished by the presence of `training.meta`:
+
+| Form | Contents | Used by |
+|---|---|---|
+| **Inference export** | folded conv weight/bias, dense layers | MCTS, `human`, deployment, native CPU inference |
+| **Training checkpoint** | raw conv weight/bias, batch-norm gamma/beta/running statistics, dense layers, batch index | resuming training |
+
+Folding batch norm into the convolution is exact for inference but changes the
+parameterisation -- the four batch-norm tensors no longer exist -- so a
+folded-only file cannot resume training faithfully. `evaluate_and_save()`
+writes both, and `load()` detects either form.
 
 ## Tests
 
