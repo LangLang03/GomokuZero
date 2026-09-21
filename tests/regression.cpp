@@ -171,17 +171,26 @@ int main() {
               "a leaf position must encode differently from the root; encoding "
               "the root for every leaf makes MCTS evaluate the wrong position");
 
-        // And the network must actually respond to that difference.
+        // And the network must actually respond to that difference. Compare
+        // the near-empty board against a full one, so the distinction is large
+        // enough for any trunk size to resolve (a sanitizer build shrinks it).
+        Board full;
+        const int opening[] = {112, 113, 127, 128, 97, 98, 143, 142, 82, 83,
+                               67, 68, 52, 53, 37, 38, 22, 23, 7, 8};
+        for (int m : opening) full.play(m);
+        std::vector<float> full_state(4 * BOARD_CELLS);
+        full.encode_state(full_state.data());
+
         PureNet net;
-        std::vector<float> root_log, leaf_log;
-        float root_value = 0.0f, leaf_value = 0.0f;
+        std::vector<float> root_log, full_log;
+        float root_value = 0.0f, full_value = 0.0f;
         net.forward_one(root_state, root_log, root_value);
-        net.forward_one(leaf_state, leaf_log, leaf_value);
+        net.forward_one(full_state, full_log, full_value);
         double max_difference = 0.0;
         for (size_t i = 0; i < root_log.size(); ++i)
             max_difference =
                 std::max(max_difference,
-                         std::abs(static_cast<double>(root_log[i]) - leaf_log[i]));
+                         std::abs(static_cast<double>(root_log[i]) - full_log[i]));
         CHECK(max_difference > 1e-6,
               "network output must differ between distinct positions");
     }
