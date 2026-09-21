@@ -59,10 +59,13 @@ int main() {
                 NetConfig::receptive_field(), NetConfig::receptive_field());
 
     // The trunk must be able to see far enough to judge five in a row.
-    // 25 convolutions stack to a 51x51 window; anything spanning the board is
-    // enough to judge five in a row.
-    CHECK(NetConfig::receptive_field() >= 15,
-          "receptive field must span the board");
+    // The production trunk stacks 25 convolutions into a 51x51 window, which
+    // spans the board and so can see a five in a row. A sanitizer build
+    // deliberately shrinks the trunk, so only require the production shape to
+    // satisfy this.
+    if (!NetConfig::kShrunkForSanitizer())
+        CHECK(NetConfig::receptive_field() >= 15,
+              "receptive field must span the board");
     if (!NetConfig::kShrunkForSanitizer())
         CHECK(parameters > 1000000,
               "network should have a usable parameter count");
