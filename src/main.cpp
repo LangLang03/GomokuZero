@@ -16,7 +16,7 @@ static void print_usage() {
         "Usage: gomoku_train <command> [options]\n"
         "  train  --init <bin_dir> --games N --playout N --batch-games N\n"
         "         [--mix <prefix>] [--mix-ratio 0.5] [--check-freq 50]\n"
-        "         [--threads N] [--int8] [--cpu] [--tag name]\n"
+        "         [--threads N] [--cpu] [--tag name]\n"
         "         [--batch-size N] [--epochs N] [--buffer N]\n"
         "         [--lr 2e-3] [--lr-final-fraction 0.1] [--lr-warmup 2]\n"
         "         [--weight-decay 1e-4] [--grad-clip 2.0]\n"
@@ -27,7 +27,7 @@ static void print_usage() {
         "         [--dirichlet-alpha 0.3] [--max-candidates 60]\n"
         "         [--virtual-loss 3.0] [--unseen-smooth 0.05]\n"
         "  selfplay --model <bin_dir> --playout N --games N [--batch N]\n"
-        "         [--threads N] [--int8] [--cpu] (CUDA is automatic)\n"
+        "         [--threads N] [--cpu] (CUDA is automatic)\n"
         "         (benchmark self-play throughput)\n"
         "  human  --model <bin_dir> --playout N  (play vs AI, moves: 'r,c')\n";
 }
@@ -36,7 +36,6 @@ int cmd_train(int argc, char** argv) {
     std::string init, mix, tag = "cpp";
     int games = 1000, batch_games = 64;
     int n_threads = -1;
-    bool int8_inference = false;
     bool force_cpu = false;
 
     SearchConfig search;
@@ -59,7 +58,10 @@ int cmd_train(int argc, char** argv) {
         else if (a == "--check-freq") { train.check_freq = next_int(); }
         else if (a == "--mix-ratio") { train.mix_ratio = next_float(); }
         else if (a == "--threads") { n_threads = next_int(); }
-        else if (a == "--int8") { int8_inference = true; }
+        else if (a == "--int8") {
+            std::cerr << "[net] --int8 was removed with the new architecture; "
+                         "ignoring\n";
+        }
         else if (a == "--cpu") { force_cpu = true; }
         // Optimiser / schedule.
         else if (a == "--lr") { train.lr_base = next_double(); }
@@ -93,9 +95,6 @@ int cmd_train(int argc, char** argv) {
     if (!init.empty() && !net.load(init)) {
         std::cerr << "model load failed; starting from scratch\n";
     }
-    net.set_quantized_inference(int8_inference);
-    if (int8_inference && net.using_cuda())
-        std::cerr << "[net] --int8 is CPU-only; CUDA uses FP32/TF32\n";
     std::cerr << "[net] backend: "
               << (net.using_cuda() ? "CUDA (LibTorch)" : "CPU (native)")
               << "\n";
@@ -109,7 +108,6 @@ int cmd_selfplay(int argc, char** argv) {
     std::string model;
     int playout = 400, games = 4, batch = 4;
     int n_threads = -1;
-    bool int8_inference = false;
     bool force_cpu = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -118,15 +116,15 @@ int cmd_selfplay(int argc, char** argv) {
         else if (a == "--games") { if (i+1<argc) games = std::stoi(argv[++i]); }
         else if (a == "--batch") { if (i+1<argc) batch = std::stoi(argv[++i]); }
         else if (a == "--threads") { if (i+1<argc) n_threads = std::stoi(argv[++i]); }
-        else if (a == "--int8") { int8_inference = true; }
+        else if (a == "--int8") {
+            std::cerr << "[net] --int8 was removed with the new architecture; "
+                         "ignoring\n";
+        }
         else if (a == "--cpu") { force_cpu = true; }
     }
     PureNet net(2e-3);
     net.set_cuda_enabled(!force_cpu);
     if (!net.load(model)) return 1;
-    net.set_quantized_inference(int8_inference);
-    if (int8_inference && net.using_cuda())
-        std::cerr << "[net] --int8 is CPU-only; CUDA uses FP32/TF32\n";
 
     BatchedSelfPlay sp(net, 5.0f, playout, batch, n_threads);
     auto t0 = std::chrono::steady_clock::now();

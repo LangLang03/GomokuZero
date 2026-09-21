@@ -145,8 +145,7 @@ if(BUILD_TESTING)
                      INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
     endif()
     gomok_apply_sanitizer(gomoku_smoke)
-    add_test(NAME gomoku_smoke COMMAND gomoku_smoke
-        "${CMAKE_CURRENT_BINARY_DIR}/smoke_model")
+    add_test(NAME gomoku_smoke COMMAND gomoku_smoke)
 
     add_executable(gomoku_game_test
         tests/game_test.cpp
@@ -163,4 +162,30 @@ if(BUILD_TESTING)
     target_include_directories(gomoku_gradient_test PRIVATE src)
     gomok_apply_sanitizer(gomoku_gradient_test)
     add_test(NAME gomoku_gradient_test COMMAND gomoku_gradient_test)
+
+    # CPU forward vs LibTorch forward on identical weights.
+    add_executable(gomoku_backend_parity
+        tests/backend_parity.cpp
+        src/game.cpp
+        src/network.cpp
+        src/gradient.cpp
+        src/logger.cpp
+    )
+    target_include_directories(gomoku_backend_parity PRIVATE src)
+    target_link_libraries(gomoku_backend_parity PRIVATE pthread)
+    if(Torch_FOUND)
+        target_sources(gomoku_backend_parity PRIVATE src/network_cuda.cpp)
+        target_compile_definitions(gomoku_backend_parity PRIVATE GOMOK_HAS_TORCH=1
+                                   _GLIBCXX_USE_CXX11_ABI=1)
+        target_include_directories(gomoku_backend_parity SYSTEM PRIVATE
+            "${GOMOK_TORCH_INCLUDE}"
+            "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
+        target_link_libraries(gomoku_backend_parity PRIVATE "${TORCH_LIBRARIES}")
+        set_property(TARGET gomoku_backend_parity PROPERTY BUILD_RPATH
+                     "${GOMOK_TORCH_LIB}")
+    else()
+        target_sources(gomoku_backend_parity PRIVATE src/network_cuda_stub.cpp)
+    endif()
+    gomok_apply_sanitizer(gomoku_backend_parity)
+    add_test(NAME gomoku_backend_parity COMMAND gomoku_backend_parity)
 endif()

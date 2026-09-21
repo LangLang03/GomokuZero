@@ -9,6 +9,7 @@ CudaNetworkBackend::CudaNetworkBackend(PureNet&, double)
     : impl_(std::make_unique<Impl>()) {}
 CudaNetworkBackend::~CudaNetworkBackend() = default;
 bool CudaNetworkBackend::available() const { return false; }
+bool CudaNetworkBackend::load(const std::string&) { return false; }
 void CudaNetworkBackend::set_weight_decay(double) {}
 void CudaNetworkBackend::sync_from_cpu() {}
 void CudaNetworkBackend::sync_to_cpu() {}

@@ -1,70 +1,188 @@
 #include "network_cuda.h"
-#include <algorithm>
+#include "net_config.h"
+#include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <iostream>
-#include <limits>
+#include <stdexcept>
+
+#ifdef GOMOK_HAS_TORCH
 #include <torch/torch.h>
 
 namespace gomoku {
 namespace {
 
-class CudaNetImpl : public torch::nn::Module {
-public:
-    CudaNetImpl()
-        : conv1(torch::nn::Conv2dOptions(4, 32, 3).padding(1)),
-          conv2(torch::nn::Conv2dOptions(32, 64, 3).padding(1)),
-          conv3(torch::nn::Conv2dOptions(64, 128, 3).padding(1)),
-          act_conv1(torch::nn::Conv2dOptions(128, 4, 1)),
-          act_fc1(4 * 225, 225),
-          val_conv1(torch::nn::Conv2dOptions(128, 2, 1)),
-          val_fc1(2 * 225, 64),
-          val_fc2(64, 1) {
-        register_module("conv1", conv1);
-        register_module("conv2", conv2);
-        register_module("conv3", conv3);
-        register_module("act_conv1", act_conv1);
-        register_module("act_fc1", act_fc1);
-        register_module("val_conv1", val_conv1);
-        register_module("val_fc1", val_fc1);
-        register_module("val_fc2", val_fc2);
+constexpr int kCells = NetConfig::kCells;
+constexpr int kChannels = NetConfig::kChannels;
+constexpr int kResBlocks = NetConfig::kResBlocks;
+
+// Uniform init on [-bound, bound] with bound = gain * sqrt(6 / fan_in),
+// which is the He/Glorot family without depending on the enum-typed
+// initialiser API (whose spelling changes between LibTorch releases).
+torch::Tensor uniform_tensor(torch::IntArrayRef sizes, double fan_in,
+                             double gain, torch::Generator& generator) {
+    const double bound = gain * std::sqrt(6.0 / std::max(1.0, fan_in));
+    return torch::rand(sizes, generator, torch::TensorOptions().dtype(torch::kFloat32))
+               .mul(2.0 * bound)
+               .sub(bound);
+}
+
+
+// Two 3x3 convolutions with a skip connection, each followed by batch norm.
+struct ResBlockImpl : torch::nn::Module {
+    ResBlockImpl(int channels, double residual_gain)
+        : conv_a(torch::nn::Conv2dOptions(channels, channels, 3).padding(1)),
+          bn_a(channels),
+          conv_b(torch::nn::Conv2dOptions(channels, channels, 3).padding(1)),
+          bn_b(channels) {
+        register_module("conv_a", conv_a);
+        register_module("bn_a", bn_a);
+        register_module("conv_b", conv_b);
+        register_module("bn_b", bn_b);
+        auto generator = torch::make_generator<torch::CPUGeneratorImpl>(
+            static_cast<uint64_t>(channels) * 7919u + 17u);
+        torch::NoGradGuard no_grad;
+        const double fan_in = static_cast<double>(channels) * 9.0;
+        conv_a->weight.copy_(uniform_tensor(conv_a->weight.sizes(), fan_in,
+                                            1.0, generator));
+        conv_a->bias.zero_();
+        conv_b->weight.copy_(uniform_tensor(conv_b->weight.sizes(), fan_in,
+                                            residual_gain, generator));
+        conv_b->bias.zero_();
     }
 
-    std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor input) {
-        auto trunk = torch::relu(conv1->forward(input));
-        trunk = torch::relu(conv2->forward(trunk));
-        trunk = torch::relu(conv3->forward(trunk));
-
-        auto policy = torch::relu(act_conv1->forward(trunk));
-        policy = policy.reshape({-1, 4 * 225});
-        policy = torch::log_softmax(act_fc1->forward(policy), 1);
-
-        auto value = torch::leaky_relu(val_conv1->forward(trunk), 0.01);
-        value = value.reshape({-1, 2 * 225});
-        value = torch::leaky_relu(val_fc1->forward(value), 0.01);
-        value = torch::tanh(val_fc2->forward(value));
-        return {policy, value};
+    torch::Tensor forward(torch::Tensor x) {
+        torch::Tensor out = torch::relu(bn_a(conv_a(x)));
+        out = bn_b(conv_b(out));
+        return torch::relu(x + out);
     }
 
-    torch::nn::Conv2d conv1{nullptr}, conv2{nullptr}, conv3{nullptr};
-    torch::nn::Conv2d act_conv1{nullptr};
-    torch::nn::Linear act_fc1{nullptr};
-    torch::nn::Conv2d val_conv1{nullptr};
-    torch::nn::Linear val_fc1{nullptr}, val_fc2{nullptr};
+    torch::nn::Conv2d conv_a{nullptr}, conv_b{nullptr};
+    torch::nn::BatchNorm2d bn_a{nullptr}, bn_b{nullptr};
+};
+TORCH_MODULE(ResBlock);
+
+struct CudaNetImpl : torch::nn::Module {
+    CudaNetImpl() {
+        stem = register_module(
+            "stem",
+            torch::nn::Conv2d(torch::nn::Conv2dOptions(
+                                  NetConfig::kInputChannels, kChannels, 3)
+                                  .padding(1)));
+        stem_bn = register_module("stem_bn", torch::nn::BatchNorm2d(kChannels));
+        for (int i = 0; i < kResBlocks; ++i) {
+            auto block = ResBlock(kChannels, 0.1);
+            register_module("res" + std::to_string(i), block);
+            trunk.push_back(block);
+        }
+        policy_conv = register_module(
+            "policy_conv",
+            torch::nn::Conv2d(torch::nn::Conv2dOptions(kChannels, 2, 1)));
+        policy_bn = register_module("policy_bn", torch::nn::BatchNorm2d(2));
+        policy_fc = register_module(
+            "policy_fc", torch::nn::Linear(2 * kCells, kCells));
+        value_conv = register_module(
+            "value_conv",
+            torch::nn::Conv2d(torch::nn::Conv2dOptions(kChannels, 1, 1)));
+        value_bn = register_module("value_bn", torch::nn::BatchNorm2d(1));
+        value_fc1 = register_module(
+            "value_fc1", torch::nn::Linear(kCells, NetConfig::kValueHidden));
+        value_fc2 =
+            register_module("value_fc2", torch::nn::Linear(NetConfig::kValueHidden, 1));
+
+        auto generator =
+            torch::make_generator<torch::CPUGeneratorImpl>(20240816u);
+        torch::NoGradGuard no_grad;
+        const double stem_fan_in =
+            static_cast<double>(NetConfig::kInputChannels) * 9.0;
+        stem->weight.copy_(
+            uniform_tensor(stem->weight.sizes(), stem_fan_in, 1.0, generator));
+        stem->bias.zero_();
+        for (auto& head : {policy_conv, value_conv}) {
+            const double fan_in = static_cast<double>(kChannels) *
+                                  static_cast<double>(head->weight.size(2) *
+                                                      head->weight.size(3));
+            head->weight.copy_(
+                uniform_tensor(head->weight.sizes(), fan_in, 1.0, generator));
+            head->bias.zero_();
+        }
+        for (auto* fc : {&policy_fc, &value_fc1, &value_fc2}) {
+            const double fan_in = static_cast<double>((*fc)->weight.size(1));
+            const double fan_out = static_cast<double>((*fc)->weight.size(0));
+            (*fc)->weight.copy_(uniform_tensor((*fc)->weight.sizes(),
+                                               fan_in + fan_out, 1.0,
+                                               generator));
+            (*fc)->bias.zero_();
+        }
+    }
+
+    std::pair<torch::Tensor, torch::Tensor> forward(torch::Tensor x) {
+        torch::Tensor h = torch::relu(stem_bn(stem(x)));
+        for (auto& block : trunk) h = block->forward(h);
+
+        torch::Tensor p = torch::relu(policy_bn(policy_conv(h)));
+        p = p.reshape({-1, 2 * kCells});
+        p = torch::log_softmax(policy_fc(p), 1);
+
+        torch::Tensor v = torch::relu(value_bn(value_conv(h)));
+        v = v.reshape({-1, kCells});
+        v = torch::relu(value_fc1(v));
+        v = torch::tanh(value_fc2(v));
+        return {p, v};
+    }
+
+    torch::nn::Conv2d stem{nullptr};
+    torch::nn::BatchNorm2d stem_bn{nullptr};
+    std::vector<ResBlock> trunk;
+    torch::nn::Conv2d policy_conv{nullptr}, value_conv{nullptr};
+    torch::nn::BatchNorm2d policy_bn{nullptr}, value_bn{nullptr};
+    torch::nn::Linear policy_fc{nullptr}, value_fc1{nullptr}, value_fc2{nullptr};
 };
 TORCH_MODULE(CudaNet);
 
-bool save_tensor(const std::string& path, const torch::Tensor& tensor) {
+// Batch normalisation folded into its convolution, which is the on-disk form
+// the native CPU path reads. Folding is an exact affine rewrite of inference,
+// so both implementations see identical numbers.
+void fold_bn(const torch::Tensor& weight, const torch::Tensor& bias,
+             const torch::Tensor& gamma, const torch::Tensor& beta,
+             const torch::Tensor& mean, const torch::Tensor& var, double eps,
+             torch::Tensor& out_w, torch::Tensor& out_b) {
+    const torch::Tensor inv_std = 1.0 / (var + eps).sqrt();
+    const torch::Tensor scale = (gamma * inv_std).view({-1, 1, 1, 1});
+    out_w = (weight * scale).contiguous();
+    out_b = (beta - gamma * mean * inv_std + bias.flatten() * scale.flatten())
+                .contiguous();
+}
+
+std::vector<float> to_vector(const torch::Tensor& tensor) {
     const torch::Tensor cpu = tensor.detach().to(torch::kCPU).contiguous();
-    if (cpu.numel() > std::numeric_limits<uint32_t>::max()) return false;
-    std::ofstream file(path, std::ios::binary);
-    if (!file) return false;
-    const uint32_t count = static_cast<uint32_t>(cpu.numel());
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    file.write(reinterpret_cast<const char*>(cpu.data_ptr<float>()),
-               static_cast<std::streamsize>(count * sizeof(float)));
-    return static_cast<bool>(file);
+    std::vector<float> out(static_cast<size_t>(cpu.numel()));
+    std::memcpy(out.data(), cpu.data_ptr<float>(), out.size() * sizeof(float));
+    return out;
+}
+
+bool write_bin(const std::string& path, const std::vector<float>& data) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    const uint32_t count = static_cast<uint32_t>(data.size());
+    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    f.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(count * sizeof(float)));
+    return static_cast<bool>(f);
+}
+
+bool read_bin(const std::string& path, std::vector<float>& data, size_t n) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    uint32_t count = 0;
+    f.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!f || count != n) return false;
+    data.resize(count);
+    f.read(reinterpret_cast<char*>(data.data()),
+           static_cast<std::streamsize>(count * sizeof(float)));
+    return static_cast<bool>(f);
 }
 
 }  // namespace
@@ -82,9 +200,8 @@ struct CudaNetworkBackend::Impl {
             at::globalContext().setAllowTF32CuBLAS(true);
             net->to(device);
             optimizer = std::make_unique<torch::optim::Adam>(
-                net->parameters(),
-                torch::optim::AdamOptions(learning_rate)
-                    .weight_decay(owner.weight_decay()));
+                net->parameters(), torch::optim::AdamOptions(learning_rate)
+                                       .weight_decay(owner.weight_decay()));
         } catch (const c10::Error& error) {
             std::cerr << "[net] CUDA initialization failed: "
                       << error.what_without_backtrace() << '\n';
@@ -93,21 +210,25 @@ struct CudaNetworkBackend::Impl {
         }
     }
 
-    void copy_to_parameter(torch::Tensor parameter,
-                           const std::vector<float>& source) {
-        torch::NoGradGuard no_grad;
-        auto tensor = torch::from_blob(
-            const_cast<float*>(source.data()), parameter.sizes(),
-            torch::TensorOptions().dtype(torch::kFloat32));
-        parameter.copy_(tensor.to(device));
+    // Visits every convolution / batch-norm pair in a fixed order.
+    template <typename Fn>
+    void for_each_conv(Fn&& fn) {
+        fn("stem", net->stem, net->stem_bn);
+        for (int i = 0; i < kResBlocks; ++i) {
+            ResBlock& block = net->trunk[static_cast<size_t>(i)];
+            const std::string base = "res" + std::to_string(i);
+            fn(base + "_a", block->conv_a, block->bn_a);
+            fn(base + "_b", block->conv_b, block->bn_b);
+        }
+        fn("policy_conv1", net->policy_conv, net->policy_bn);
+        fn("val_conv1", net->value_conv, net->value_bn);
     }
 
-    void copy_from_parameter(const torch::Tensor& parameter,
-                             std::vector<float>& destination) {
-        const torch::Tensor cpu = parameter.detach().to(torch::kCPU).contiguous();
-        destination.resize(static_cast<size_t>(cpu.numel()));
-        std::memcpy(destination.data(), cpu.data_ptr<float>(),
-                    destination.size() * sizeof(float));
+    template <typename Fn>
+    void for_each_fc(Fn&& fn) {
+        fn("act_fc1", net->policy_fc);
+        fn("val_fc1", net->value_fc1);
+        fn("val_fc2", net->value_fc2);
     }
 
     PureNet& owner;
@@ -131,93 +252,121 @@ void CudaNetworkBackend::set_weight_decay(double weight_decay) {
             .weight_decay(weight_decay);
 }
 
-void CudaNetworkBackend::sync_from_cpu() {
-    if (!available()) return;
+void CudaNetworkBackend::sync_to_cpu() {
+    if (!impl_->available) return;
     PureNet& owner = impl_->owner;
-    impl_->copy_to_parameter(impl_->net->conv1->weight, owner.c1_.w);
-    impl_->copy_to_parameter(impl_->net->conv1->bias, owner.c1_.b);
-    impl_->copy_to_parameter(impl_->net->conv2->weight, owner.c2_.w);
-    impl_->copy_to_parameter(impl_->net->conv2->bias, owner.c2_.b);
-    impl_->copy_to_parameter(impl_->net->conv3->weight, owner.c3_.w);
-    impl_->copy_to_parameter(impl_->net->conv3->bias, owner.c3_.b);
-    impl_->copy_to_parameter(impl_->net->act_conv1->weight, owner.act_c_.w);
-    impl_->copy_to_parameter(impl_->net->act_conv1->bias, owner.act_c_.b);
-    impl_->copy_to_parameter(impl_->net->act_fc1->weight, owner.act_fc_.w);
-    impl_->copy_to_parameter(impl_->net->act_fc1->bias, owner.act_fc_.b);
-    impl_->copy_to_parameter(impl_->net->val_conv1->weight, owner.val_c_.w);
-    impl_->copy_to_parameter(impl_->net->val_conv1->bias, owner.val_c_.b);
-    impl_->copy_to_parameter(impl_->net->val_fc1->weight, owner.val_fc1_.w);
-    impl_->copy_to_parameter(impl_->net->val_fc1->bias, owner.val_fc1_.b);
-    impl_->copy_to_parameter(impl_->net->val_fc2->weight, owner.val_fc2_.w);
-    impl_->copy_to_parameter(impl_->net->val_fc2->bias, owner.val_fc2_.b);
+
+    // Export through the same files the native loader reads. save()/load()
+    // are covered by the round-trip part of the parity test, whereas copying
+    // individual tensors requires keeping two different layouts in sync by
+    // hand.
+    namespace fs = std::filesystem;
+    std::error_code error;
+    const fs::path staging =
+        fs::temp_directory_path(error) / "gomoku_cuda_to_cpu";
+    if (error) return;
+    if (!save(staging.string())) return;
+    if (owner.load_native(staging.string())) owner.loaded_ = true;
+    fs::remove_all(staging, error);
 }
 
-void CudaNetworkBackend::sync_to_cpu() {
-    if (!available()) return;
-    PureNet& owner = impl_->owner;
-    impl_->copy_from_parameter(impl_->net->conv1->weight, owner.c1_.w);
-    impl_->copy_from_parameter(impl_->net->conv1->bias, owner.c1_.b);
-    impl_->copy_from_parameter(impl_->net->conv2->weight, owner.c2_.w);
-    impl_->copy_from_parameter(impl_->net->conv2->bias, owner.c2_.b);
-    impl_->copy_from_parameter(impl_->net->conv3->weight, owner.c3_.w);
-    impl_->copy_from_parameter(impl_->net->conv3->bias, owner.c3_.b);
-    impl_->copy_from_parameter(impl_->net->act_conv1->weight, owner.act_c_.w);
-    impl_->copy_from_parameter(impl_->net->act_conv1->bias, owner.act_c_.b);
-    impl_->copy_from_parameter(impl_->net->act_fc1->weight, owner.act_fc_.w);
-    impl_->copy_from_parameter(impl_->net->act_fc1->bias, owner.act_fc_.b);
-    impl_->copy_from_parameter(impl_->net->val_conv1->weight, owner.val_c_.w);
-    impl_->copy_from_parameter(impl_->net->val_conv1->bias, owner.val_c_.b);
-    impl_->copy_from_parameter(impl_->net->val_fc1->weight, owner.val_fc1_.w);
-    impl_->copy_from_parameter(impl_->net->val_fc1->bias, owner.val_fc1_.b);
-    impl_->copy_from_parameter(impl_->net->val_fc2->weight, owner.val_fc2_.w);
-    impl_->copy_from_parameter(impl_->net->val_fc2->bias, owner.val_fc2_.b);
-    owner.rebuild_quantized_weights();
+void CudaNetworkBackend::sync_from_cpu() {
+    if (!impl_->available) return;
+    // The native side only ever holds folded weights for inference, so there
+    // is nothing meaningful to push back into the trainable parameters.
+}
+
+bool CudaNetworkBackend::load(const std::string& directory) {
+    if (!impl_->available) return false;
+    torch::NoGradGuard no_grad;
+    bool ok = true;
+    impl_->for_each_conv([&](const std::string& name, torch::nn::Conv2d& conv,
+                             torch::nn::BatchNorm2d& bn) {
+        if (!ok) return;
+        const size_t weight_n = static_cast<size_t>(conv->weight.numel());
+        const size_t bias_n = static_cast<size_t>(conv->bias.numel());
+        std::vector<float> w, b;
+        if (!read_bin(directory + "/" + name + "_weight.bin", w, weight_n) ||
+            !read_bin(directory + "/" + name + "_bias.bin", b, bias_n)) {
+            ok = false;
+            return;
+        }
+        auto weight = torch::from_blob(w.data(), conv->weight.sizes(),
+                                       torch::TensorOptions().dtype(torch::kFloat32));
+        auto bias = torch::from_blob(b.data(), conv->bias.sizes(),
+                                     torch::TensorOptions().dtype(torch::kFloat32));
+        conv->weight.copy_(weight.to(impl_->device));
+        conv->bias.copy_(bias.to(impl_->device));
+        // The stored tensors already have batch norm folded in. Setting
+        // running_var to 1 - eps makes the fold factor exactly
+        // 1/sqrt((1-eps)+eps) = 1, so re-saving reproduces the same numbers
+        // instead of scaling them by 1/sqrt(1+eps) on every round trip.
+        bn->weight.fill_(1.0);
+        bn->bias.fill_(0.0);
+        bn->running_mean.fill_(0.0);
+        bn->running_var.fill_(1.0 - bn->options.eps());
+    });
+    impl_->for_each_fc([&](const std::string& name, torch::nn::Linear& fc) {
+        if (!ok) return;
+        const size_t weight_n = static_cast<size_t>(fc->weight.numel());
+        const size_t bias_n = static_cast<size_t>(fc->bias.numel());
+        std::vector<float> w, b;
+        if (!read_bin(directory + "/" + name + "_weight.bin", w, weight_n) ||
+            !read_bin(directory + "/" + name + "_bias.bin", b, bias_n)) {
+            ok = false;
+            return;
+        }
+        auto weight = torch::from_blob(w.data(), fc->weight.sizes(),
+                                       torch::TensorOptions().dtype(torch::kFloat32));
+        auto bias = torch::from_blob(b.data(), fc->bias.sizes(),
+                                     torch::TensorOptions().dtype(torch::kFloat32));
+        fc->weight.copy_(weight.to(impl_->device));
+        fc->bias.copy_(bias.to(impl_->device));
+    });
+    return ok;
 }
 
 bool CudaNetworkBackend::save(const std::string& directory) const {
-    if (!available()) return false;
-    std::error_code error;
-    std::filesystem::create_directories(directory, error);
-    if (error) return false;
-    const auto save_layer = [&](const char* name,
-                                const torch::Tensor& weight,
-                                const torch::Tensor& bias) {
-        return save_tensor(directory + "/" + name + "_weight.bin", weight) &&
-               save_tensor(directory + "/" + name + "_bias.bin", bias);
-    };
-    return save_layer("conv1", impl_->net->conv1->weight,
-                      impl_->net->conv1->bias) &&
-           save_layer("conv2", impl_->net->conv2->weight,
-                      impl_->net->conv2->bias) &&
-           save_layer("conv3", impl_->net->conv3->weight,
-                      impl_->net->conv3->bias) &&
-           save_layer("act_conv1", impl_->net->act_conv1->weight,
-                      impl_->net->act_conv1->bias) &&
-           save_layer("act_fc1", impl_->net->act_fc1->weight,
-                      impl_->net->act_fc1->bias) &&
-           save_layer("val_conv1", impl_->net->val_conv1->weight,
-                      impl_->net->val_conv1->bias) &&
-           save_layer("val_fc1", impl_->net->val_fc1->weight,
-                      impl_->net->val_fc1->bias) &&
-           save_layer("val_fc2", impl_->net->val_fc2->weight,
-                      impl_->net->val_fc2->bias);
+    if (!impl_->available) return false;
+    torch::NoGradGuard no_grad;
+    bool ok = true;
+    impl_->for_each_conv([&](const std::string& name, torch::nn::Conv2d& conv,
+                             torch::nn::BatchNorm2d& bn) {
+        if (!ok) return;
+        torch::Tensor w, b;
+        fold_bn(conv->weight, conv->bias, bn->weight, bn->bias,
+                bn->running_mean, bn->running_var, bn->options.eps(), w, b);
+        ok = write_bin(directory + "/" + name + "_weight.bin", to_vector(w)) &&
+             write_bin(directory + "/" + name + "_bias.bin", to_vector(b));
+    });
+    impl_->for_each_fc([&](const std::string& name, torch::nn::Linear& fc) {
+        if (!ok) return;
+        ok = write_bin(directory + "/" + name + "_weight.bin",
+                       to_vector(fc->weight)) &&
+             write_bin(directory + "/" + name + "_bias.bin", to_vector(fc->bias));
+    });
+    return ok;
 }
 
-void CudaNetworkBackend::forward(const float* states, int batch,
-                                 float* policy, float* value,
-                                 bool probabilities) const {
+void CudaNetworkBackend::forward(const float* states, int batch, float* policy,
+                                 float* value, bool probabilities) const {
     torch::InferenceMode inference_mode;
+    // TF32 keeps only 10 mantissa bits. Across a 25-convolution trunk that
+    // accumulates into a visible divergence from the native CPU path, so
+    // inference stays in full fp32 and only training opts into TF32.
+    at::NoTF32Guard no_tf32;
     impl_->net->eval();
     auto cpu_states = torch::from_blob(
-        const_cast<float*>(states), {batch, 4, 15, 15},
+        const_cast<float*>(states), {batch, NetConfig::kInputChannels, 15, 15},
         torch::TensorOptions().dtype(torch::kFloat32));
-    auto [log_policy, values] = impl_->net->forward(
-        cpu_states.to(impl_->device));
-    torch::Tensor output_policy = probabilities ? log_policy.exp() : log_policy;
+    auto [log_policy, values] =
+        impl_->net->forward(cpu_states.to(impl_->device));
+    torch::Tensor output_policy =
+        probabilities ? log_policy.exp() : log_policy;
     output_policy = output_policy.to(torch::kCPU).contiguous();
     values = values.reshape({batch}).to(torch::kCPU).contiguous();
     std::memcpy(policy, output_policy.data_ptr<float>(),
-                static_cast<size_t>(batch) * 225 * sizeof(float));
+                static_cast<size_t>(batch) * kCells * sizeof(float));
     std::memcpy(value, values.data_ptr<float>(),
                 static_cast<size_t>(batch) * sizeof(float));
 }
@@ -227,41 +376,48 @@ PureNet::TrainStats CudaNetworkBackend::train_step(
     const std::vector<float>& probs, const std::vector<float>& winners,
     double learning_rate, double value_loss_weight) {
     impl_->net->train();
-    for (auto& group : impl_->optimizer->param_groups()) {
+    for (auto& group : impl_->optimizer->param_groups())
         static_cast<torch::optim::AdamOptions&>(group.options())
             .lr(learning_rate);
-    }
     impl_->optimizer->zero_grad();
 
-    auto state_tensor = torch::from_blob(
-        const_cast<float*>(states.data()), {batch, 4, 15, 15},
-        torch::TensorOptions().dtype(torch::kFloat32)).to(impl_->device);
-    auto policy_target = torch::from_blob(
-        const_cast<float*>(probs.data()), {batch, 225},
-        torch::TensorOptions().dtype(torch::kFloat32)).to(impl_->device);
-    auto value_target = torch::from_blob(
-        const_cast<float*>(winners.data()), {batch},
-        torch::TensorOptions().dtype(torch::kFloat32)).to(impl_->device);
+    auto state_tensor =
+        torch::from_blob(const_cast<float*>(states.data()),
+                         {batch, NetConfig::kInputChannels, 15, 15},
+                         torch::TensorOptions().dtype(torch::kFloat32))
+            .to(impl_->device);
+    auto policy_target =
+        torch::from_blob(const_cast<float*>(probs.data()), {batch, kCells},
+                         torch::TensorOptions().dtype(torch::kFloat32))
+            .to(impl_->device);
+    auto value_target =
+        torch::from_blob(const_cast<float*>(winners.data()), {batch},
+                         torch::TensorOptions().dtype(torch::kFloat32))
+            .to(impl_->device);
 
     auto [log_policy, values] = impl_->net->forward(state_tensor);
-    const auto value_loss = torch::mse_loss(values.reshape({batch}),
-                                            value_target);
-    const auto policy_loss = -torch::mean(torch::sum(
-        policy_target * log_policy, 1));
+    const auto value_loss =
+        torch::mse_loss(values.reshape({batch}), value_target);
+    const auto policy_loss =
+        -torch::mean(torch::sum(policy_target * log_policy, 1));
     const auto loss = value_loss * value_loss_weight + policy_loss;
     loss.backward();
     const double clip = impl_->owner.grad_clip();
     if (clip > 0.0)
         torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), clip);
     impl_->optimizer->step();
-    const auto entropy = -torch::mean(torch::sum(
-        torch::exp(log_policy) * log_policy, 1));
+    const auto entropy = -torch::mean(
+        torch::sum(torch::exp(log_policy) * log_policy, 1));
 
-    const torch::Tensor metrics = torch::stack(
-        {loss.detach(), entropy.detach(), policy_loss.detach(),
-         value_loss.detach()}).to(torch::kCPU).contiguous();
+    const torch::Tensor metrics =
+        torch::stack({loss.detach(), entropy.detach(), policy_loss.detach(),
+                      value_loss.detach()})
+            .to(torch::kCPU)
+            .contiguous();
     const float* result = metrics.data_ptr<float>();
     return {result[0], result[1], result[2], result[3]};
 }
 
 }  // namespace gomoku
+
+#endif  // GOMOK_HAS_TORCH

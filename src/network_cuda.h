@@ -13,6 +13,9 @@ public:
     ~CudaNetworkBackend();
 
     bool available() const;
+    bool load(const std::string& directory);
+    // The stored tensors have batch norm folded into the convolution, which
+    // is exactly the form the native forward pass consumes.
     void sync_from_cpu();
     void sync_to_cpu();
     bool save(const std::string& directory) const;
