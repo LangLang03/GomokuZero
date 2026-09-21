@@ -60,10 +60,22 @@ struct MatchResult {
     int wins = 0;     // first model
     int losses = 0;   // second model
     int draws = 0;
+    // Colour split, tracked because free-style gomoku gives the first player a
+    // winning advantage once the search is deep enough. A match where every
+    // game is won by whoever moved first looks like a 50% score no matter how
+    // the two models compare, so the score alone is not a strength signal.
+    int black_wins = 0;
+    int white_wins = 0;
 
     double score() const {
         // Wins count 1, draws 0.5, matching the usual Elo convention.
         return games > 0 ? (wins + 0.5 * draws) / games : 0.0;
+    }
+
+    // Fraction of decided games won by the first player.
+    double first_player_win_rate() const {
+        const int decided = black_wins + white_wins;
+        return decided > 0 ? static_cast<double>(black_wins) / decided : 0.0;
     }
 };
 

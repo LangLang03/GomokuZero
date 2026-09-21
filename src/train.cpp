@@ -378,16 +378,17 @@ void Trainer::evaluate_and_save(int batch_idx) {
 void Trainer::run_arena(int batch_idx) {
     if (config_.eval_games <= 0 || config_.baseline_dir.empty()) return;
 
-    // The baseline runs on the native CPU path: its games need far fewer
-    // evaluations than self-play, and this avoids holding two CUDA contexts.
+    // The baseline stays on whatever backend is active. play_match() merges
+    // both models' leaves into batched calls, so putting the baseline on the
+    // native CPU path would stall every round on its much slower forward pass.
     PureNet baseline(2e-3);
     if (!baseline.load(config_.baseline_dir)) {
         logger.log("[arena] baseline load failed (%s); skipping",
                    config_.baseline_dir.c_str());
         return;
     }
-    baseline.set_cuda_enabled(false);
-    baseline.set_inference_threads(1);
+    baseline.set_cuda_enabled(net_.using_cuda());
+    baseline.set_inference_threads(net_.inference_threads());
 
     SearchConfig arena = search_;
     arena.n_playout = std::max(1, config_.eval_playout);
@@ -397,9 +398,16 @@ void Trainer::run_arena(int batch_idx) {
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
             .count();
-    logger.log("[arena] batch %d | vs %s | %dW %dL %dD | score %.3f | %.0fs",
+    logger.log("[arena] batch %d | vs %s | %dW %dL %dD | score %.3f | "
+               "first-player win rate %.2f | %.0fs",
                batch_idx, config_.baseline_dir.c_str(), result.wins,
-               result.losses, result.draws, result.score(), seconds);
+               result.losses, result.draws, result.score(),
+               result.first_player_win_rate(), seconds);
+    if (result.first_player_win_rate() > 0.95 && result.games >= 8) {
+        logger.log("[arena] note: the first player won almost every game, so "
+                   "this score reflects the first-move advantage rather than "
+                   "the difference between the two models");
+    }
 }
 
 void Trainer::run() {

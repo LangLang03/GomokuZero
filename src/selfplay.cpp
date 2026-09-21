@@ -986,86 +986,116 @@ namespace {
 // Single-game MCTS used by the arena. It runs one search at a time, so it can
 // reuse the same select/expand/backup primitives as the batched self-play
 // path without any of the queueing machinery.
-struct ArenaSearch {
-    GameState game;
+// One arena game's search state.
+//
+// Several of these are advanced together by play_match() so their leaf
+// evaluations can be merged into a single batched inference call. A lone game
+// always evaluates with batch size 1, which measures ~937 eval/s on the
+// 12-block trunk against ~2600 eval/s at batch 32.
+struct ArenaGame {
+    GameState tree;
     std::vector<LeafTask> tasks;
-    std::mt19937 rng{20240816u};
+    std::vector<int> nearby;
+    std::vector<std::pair<float, int>> candidates;
+    std::mt19937 rng;
+    Board board;
+    int playout_done = 0;
+    bool candidate_is_black = true;
+    bool finished = false;
+    int winner = 0;
 
-    explicit ArenaSearch(int playouts, int max_candidates) {
+    ArenaGame(int playouts, int max_candidates, uint64_t seed)
+        : rng(static_cast<uint32_t>(seed)) {
         const size_t capacity =
             1 + static_cast<size_t>(playouts) * max_candidates;
-        game.node_capacity = capacity;
-        game.nodes = std::make_unique<GNode[]>(capacity);
+        tree.node_capacity = capacity;
+        tree.nodes = std::make_unique<GNode[]>(capacity);
         tasks.resize(static_cast<size_t>(playouts));
+        nearby.reserve(BOARD_CELLS);
+        candidates.reserve(BOARD_CELLS);
     }
 
-    // Returns the most visited root move.
-    int run(PureNet& net, const Board& board, const SearchConfig& config) {
-        reset_tree(game);
-        game.board = board;
-        std::vector<int> nearby;
-        std::vector<std::pair<float, int>> candidates;
-        std::vector<float> state(4 * BOARD_CELLS);
-        std::vector<float> policy(BOARD_CELLS);
-        float value = 0.0f;
+    // Begins the search for the current position.
+    void start_move() {
+        reset_tree(tree);
+        tree.board = board;
+        playout_done = 0;
+    }
 
-        VirtualLossWeights loss;
-        const float strength = std::max(0.0f, config.virtual_loss);
-        loss.visits = static_cast<int32_t>(std::max(1.0f, std::round(strength)));
-        loss.value_sum = static_cast<int64_t>(
-            std::llround(static_cast<double>(strength) * VALUE_SCALE));
-
-        for (int i = 0; i < config.n_playout; ++i) {
-            LeafTask& task = tasks[static_cast<size_t>(i)];
-            float terminal_value = 0.0f;
-            const SelectionResult selected =
-                select_leaf(game, config.c_puct, task, terminal_value, loss);
-            if (selected == SelectionResult::Retry) continue;
-            if (selected == SelectionResult::Terminal) {
-                backup_path(game, task.path, terminal_value, loss);
-                continue;
-            }
-            // The network must evaluate the leaf position. select_leaf() copies
-            // the root into task.board and then plays the selected actions
-            // along the path, so task.board is the leaf while game.board stays
-            // at the root.
-            task.board.encode_state(state.data());
-            net.forward_batch_policy(state.data(), 1, policy.data(), &value);
-            CachedEvaluation evaluation;
-            evaluation.value = value;
-            std::memcpy(evaluation.policy.data(), policy.data(),
-                        BOARD_CELLS * sizeof(float));
-            expand_leaf(game, task, evaluation, nearby, candidates,
-                        config.max_candidates, config.dirichlet_eps,
-                        config.dirichlet_alpha, rng);
-            backup_path(game, task.path, value, loss);
-        }
-
-        const GNode& root = game.nodes[0];
-        if (root.child_count == 0) return -1;
-        int best = 0;
-        for (int i = 1; i < root.child_count; ++i) {
-            if (game.nodes[root.child_begin + i].visits.load(
-                    std::memory_order_relaxed) >
-                game.nodes[root.child_begin + best].visits.load(
-                    std::memory_order_relaxed))
-                best = i;
-        }
-        return game.nodes[root.child_begin + best].action;
+    bool candidate_to_move() const {
+        return (board.current_player() == 1) == candidate_is_black;
     }
 };
+
+VirtualLossWeights make_virtual_loss(float strength) {
+    VirtualLossWeights loss;
+    const float clamped = std::max(0.0f, strength);
+    loss.visits = static_cast<int32_t>(std::max(1.0f, std::round(clamped)));
+    loss.value_sum = static_cast<int64_t>(
+        std::llround(static_cast<double>(clamped) * VALUE_SCALE));
+    return loss;
+}
+
+// Most visited root move, or -1 when the root has no children.
+int best_move(const GameState& game) {
+    const GNode& root = game.nodes[0];
+    if (root.child_count == 0) return -1;
+    int best = 0;
+    for (int i = 1; i < root.child_count; ++i) {
+        if (game.nodes[root.child_begin + i].visits.load(
+                std::memory_order_relaxed) >
+            game.nodes[root.child_begin + best].visits.load(
+                std::memory_order_relaxed))
+            best = i;
+    }
+    return game.nodes[root.child_begin + best].action;
+}
 
 }  // namespace
 
 int search_best_move(PureNet& net, const Board& board,
                      const SearchConfig& config) {
-    ArenaSearch search(config.n_playout, config.max_candidates);
     // Human play wants the strongest move, not exploration.
     SearchConfig greedy = config;
     greedy.dirichlet_eps = 0.0f;
     greedy.temp_high = 0.0f;
     greedy.temp_low = 0.0f;
-    const int move = search.run(net, board, greedy);
+
+    const int playouts = std::max(1, greedy.n_playout);
+    ArenaGame game(playouts, greedy.max_candidates, 20240816u);
+    game.board = board;
+    game.start_move();
+
+    const VirtualLossWeights loss = make_virtual_loss(greedy.virtual_loss);
+    std::vector<float> state(4 * BOARD_CELLS);
+    std::vector<float> policy(BOARD_CELLS);
+    float value = 0.0f;
+
+    while (game.playout_done < playouts) {
+        LeafTask& task = game.tasks[static_cast<size_t>(game.playout_done)];
+        float terminal_value = 0.0f;
+        const SelectionResult selected =
+            select_leaf(game.tree, greedy.c_puct, task, terminal_value, loss);
+        if (selected == SelectionResult::Retry) continue;
+        if (selected == SelectionResult::Terminal) {
+            backup_path(game.tree, task.path, terminal_value, loss);
+            ++game.playout_done;
+            continue;
+        }
+        task.board.encode_state(state.data());
+        net.forward_batch_policy(state.data(), 1, policy.data(), &value);
+        CachedEvaluation evaluation;
+        evaluation.value = value;
+        std::memcpy(evaluation.policy.data(), policy.data(),
+                    BOARD_CELLS * sizeof(float));
+        expand_leaf(game.tree, task, evaluation, game.nearby, game.candidates,
+                    greedy.max_candidates, greedy.dirichlet_eps,
+                    greedy.dirichlet_alpha, game.rng);
+        backup_path(game.tree, task.path, value, loss);
+        ++game.playout_done;
+    }
+
+    const int move = best_move(game.tree);
     return (move >= 0 && board.is_empty(move)) ? move : -1;
 }
 
@@ -1074,44 +1104,148 @@ MatchResult play_match(PureNet& candidate, PureNet& opponent,
     MatchResult result;
     if (games <= 0) return result;
 
-    ArenaSearch candidate_search(config.n_playout, config.max_candidates);
-    ArenaSearch opponent_search(config.n_playout, config.max_candidates);
-
-    // Explore neither side during the arena: we want the strongest move.
+    // Explore neither side during the arena: report the strongest move.
     SearchConfig arena = config;
     arena.dirichlet_eps = 0.0f;
     arena.temp_switch_move = 0;
     arena.temp_high = 0.0f;
     arena.temp_low = 0.0f;
 
-    for (int g = 0; g < games; ++g) {
-        Board board;
-        // Alternate colours so a first-move bias cannot decide the match.
-        const bool candidate_is_black = (g % 2 == 0);
-        while (true) {
-            const bool black_to_move = board.current_player() == 1;
-            PureNet& mover =
-                (black_to_move == candidate_is_black) ? candidate : opponent;
-            ArenaSearch& search =
-                (black_to_move == candidate_is_black) ? candidate_search
-                                                      : opponent_search;
-            const int move = search.run(mover, board, arena);
-            if (move < 0 || !board.is_empty(move)) break;
-            board.play(move);
-            const int winner = board.winner();
-            if (winner != 0) {
-                result.wins +=
-                    (winner == 1) == candidate_is_black ? 1 : 0;
-                result.losses +=
-                    (winner == 1) == candidate_is_black ? 0 : 1;
-                break;
+    const int playouts = std::max(1, arena.n_playout);
+    const VirtualLossWeights loss = make_virtual_loss(arena.virtual_loss);
+
+    // Games advanced in lockstep. Each round every unfinished game contributes
+    // at most one leaf, and the leaves are grouped by side so each model gets
+    // one batched call. Batch size is therefore about half this number, which
+    // sits near the throughput peak for this trunk; a single game would force
+    // batch 1 and roughly a third of the throughput.
+    const int kParallelGames = std::min(games, 32);
+    const size_t per_state = 4 * BOARD_CELLS;
+
+    std::vector<float> states, policies, values;
+    std::vector<int> pending, group;
+
+    for (int base = 0; base < games; base += kParallelGames) {
+        const int n = std::min(kParallelGames, games - base);
+        std::vector<std::unique_ptr<ArenaGame>> ctx;
+        ctx.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            auto game = std::make_unique<ArenaGame>(
+                playouts, arena.max_candidates,
+                0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(base + i + 1));
+            // Alternate colours so a first-move bias cannot decide the match.
+            game->candidate_is_black = ((base + i) % 2 == 0);
+            game->start_move();
+            ctx.push_back(std::move(game));
+        }
+
+        int remaining = n;
+        while (remaining > 0) {
+            // Advance each unfinished game to its next inference request.
+            pending.clear();
+            for (int i = 0; i < n; ++i) {
+                ArenaGame& game = *ctx[static_cast<size_t>(i)];
+                if (game.finished) continue;
+                bool needs_inference = false;
+                while (game.playout_done < playouts) {
+                    LeafTask& task =
+                        game.tasks[static_cast<size_t>(game.playout_done)];
+                    float terminal_value = 0.0f;
+                    const SelectionResult selected = select_leaf(
+                        game.tree, arena.c_puct, task, terminal_value, loss);
+                    if (selected == SelectionResult::Retry) continue;
+                    if (selected == SelectionResult::Terminal) {
+                        backup_path(game.tree, task.path, terminal_value, loss);
+                        ++game.playout_done;
+                        continue;
+                    }
+                    needs_inference = true;
+                    break;
+                }
+                if (needs_inference) pending.push_back(i);
             }
-            if (board.move_count() == BOARD_CELLS) {
-                ++result.draws;
-                break;
+
+            if (pending.empty()) {
+                // Every unfinished game finished this move's budget: play it.
+                for (int i = 0; i < n; ++i) {
+                    ArenaGame& game = *ctx[static_cast<size_t>(i)];
+                    if (game.finished) continue;
+                    const int move = best_move(game.tree);
+                    if (move < 0 || !game.board.is_empty(move)) {
+                        game.finished = true;
+                        --remaining;
+                        continue;
+                    }
+                    game.board.play(move);
+                    const int winner = game.board.winner();
+                    if (winner != 0 || game.board.move_count() == BOARD_CELLS) {
+                        game.finished = true;
+                        game.winner = winner;
+                        --remaining;
+                        ++result.games;
+                        if (winner == 0) {
+                            ++result.draws;
+                        } else {
+                            if (winner == 1) ++result.black_wins;
+                            else ++result.white_wins;
+                            if ((winner == 1) == game.candidate_is_black)
+                                ++result.wins;
+                            else
+                                ++result.losses;
+                        }
+                        continue;
+                    }
+                    game.start_move();
+                }
+                continue;
+            }
+
+            // Two batched calls, one per model, instead of one call per leaf.
+            for (int side = 0; side < 2; ++side) {
+                group.clear();
+                for (int index : pending) {
+                    const bool is_candidate =
+                        ctx[static_cast<size_t>(index)]->candidate_to_move();
+                    if ((is_candidate ? 0 : 1) == side) group.push_back(index);
+                }
+                if (group.empty()) continue;
+                const int m = static_cast<int>(group.size());
+
+                states.resize(static_cast<size_t>(m) * per_state);
+                policies.resize(static_cast<size_t>(m) * BOARD_CELLS);
+                values.resize(static_cast<size_t>(m));
+                for (int j = 0; j < m; ++j) {
+                    ArenaGame& game = *ctx[static_cast<size_t>(group[static_cast<size_t>(j)])];
+                    LeafTask& task =
+                        game.tasks[static_cast<size_t>(game.playout_done)];
+                    task.board.encode_state(
+                        states.data() + static_cast<size_t>(j) * per_state);
+                }
+
+                PureNet& net = (side == 0) ? candidate : opponent;
+                net.forward_batch_policy(states.data(), m, policies.data(),
+                                         values.data());
+
+                for (int j = 0; j < m; ++j) {
+                    ArenaGame& game = *ctx[static_cast<size_t>(group[static_cast<size_t>(j)])];
+                    LeafTask& task =
+                        game.tasks[static_cast<size_t>(game.playout_done)];
+                    CachedEvaluation evaluation;
+                    evaluation.value = values[static_cast<size_t>(j)];
+                    std::memcpy(
+                        evaluation.policy.data(),
+                        policies.data() + static_cast<size_t>(j) * BOARD_CELLS,
+                        BOARD_CELLS * sizeof(float));
+                    expand_leaf(game.tree, task, evaluation, game.nearby,
+                                game.candidates, arena.max_candidates,
+                                arena.dirichlet_eps, arena.dirichlet_alpha,
+                                game.rng);
+                    backup_path(game.tree, task.path,
+                                values[static_cast<size_t>(j)], loss);
+                    ++game.playout_done;
+                }
             }
         }
-        ++result.games;
     }
     return result;
 }
