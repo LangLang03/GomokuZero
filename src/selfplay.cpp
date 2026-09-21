@@ -533,14 +533,22 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
     size_t next_cache_slot = 0;
     int64_t cache_hits = 0;
     int64_t total_evaluations = 0;
+    int64_t total_retries = 0;
+    int64_t total_terminal = 0;
     int inference_calls = 0;
     int largest_batch = 0;
 
     const char* seed_text = std::getenv("GOMOK_SEED");
-    const auto seed = seed_text != nullptr
+    // Derive a per-call stream from the configured seed. Without the batch
+    // counter a pinned GOMOK_SEED makes run_batch() replay identical games on
+    // every call, so the replay buffer fills with duplicates and self-play
+    // contributes no new information.
+    const uint32_t base_seed = seed_text != nullptr
         ? static_cast<uint32_t>(std::strtoul(seed_text, nullptr, 10))
         : static_cast<uint32_t>(
               std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto seed = static_cast<uint32_t>(
+        base_seed ^ (0x9e3779b9U * static_cast<uint32_t>(++batch_counter_)));
     std::vector<std::mt19937> rngs;
     rngs.reserve(batch);
     for (int i = 0; i < batch; ++i)
@@ -589,6 +597,8 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
         std::atomic<int> completion_tail{0};
         std::atomic<int> completed{0};
         std::atomic<uint64_t> claim_cursor{0};
+        std::atomic<int64_t> retries{0};
+        std::atomic<int64_t> terminal_playouts{0};
         std::atomic<bool> worker_failed{false};
         std::exception_ptr worker_error;
         std::mutex worker_error_mutex;
@@ -692,11 +702,14 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
                                 games[game_index], c_puct_, task,
                                 terminal_value, virtual_loss);
                             if (selected == SelectionResult::Retry) {
+                                retries.fetch_add(1, std::memory_order_relaxed);
                                 complete_one();
                                 std::this_thread::yield();
                                 continue;
                             }
                             if (selected == SelectionResult::Terminal) {
+                                terminal_playouts.fetch_add(
+                                    1, std::memory_order_relaxed);
                                 backup_path(games[game_index], task.path,
                                             terminal_value, virtual_loss);
                                 completed.fetch_add(1,
@@ -832,6 +845,8 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
             }
         }
 
+        total_retries += retries.load(std::memory_order_relaxed);
+        total_terminal += terminal_playouts.load(std::memory_order_relaxed);
         for (std::thread& worker : search_workers) worker.join();
         if (worker_error) std::rethrow_exception(worker_error);
         if (completed.load(std::memory_order_relaxed) != target)
@@ -933,12 +948,19 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
     if (profile) {
         std::fprintf(stderr,
             "[selfplay-profile] evals=%lld calls=%d avg_batch=%.1f "
-            "max_batch=%d cache_hits=%lld cache_size=%zu mcts_threads=%d\n",
+            "max_batch=%d cache_hits=%lld cache_hit_rate=%.3f cache_size=%zu "
+            "retries=%lld terminal=%lld mcts_threads=%d\n",
             static_cast<long long>(total_evaluations), inference_calls,
             inference_calls == 0 ? 0.0
                 : static_cast<double>(total_evaluations) / inference_calls,
             largest_batch, static_cast<long long>(cache_hits),
-            evaluation_cache_values.size(), mcts_threads_);
+            total_evaluations == 0 ? 0.0
+                : static_cast<double>(cache_hits) /
+                      static_cast<double>(total_evaluations),
+            evaluation_cache_values.size(),
+            static_cast<long long>(total_retries),
+            static_cast<long long>(total_terminal),
+            mcts_threads_);
     }
 
     std::vector<std::vector<Sample>> result(batch);
