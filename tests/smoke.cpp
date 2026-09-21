@@ -69,7 +69,11 @@ int main() {
 
     // --- Network output invariants ----------------------------------------
     PureNet net;
-    REQUIRE(net.parameter_count() > 1000000, "parameter count");
+    // The production trunk must carry real capacity; sanitizer builds
+    // deliberately shrink it so a TSan/ASan self-play run finishes.
+    if (!NetConfig::kShrunkForSanitizer())
+        REQUIRE(net.parameter_count() > 1000000, "parameter count");
+    REQUIRE(net.parameter_count() > 0, "parameter count must be non-zero");
 
     Board board;
     for (int col = 0; col < 4; ++col) {

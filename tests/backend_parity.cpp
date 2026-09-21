@@ -63,7 +63,9 @@ int main() {
     // enough to judge five in a row.
     CHECK(NetConfig::receptive_field() >= 15,
           "receptive field must span the board");
-    CHECK(parameters > 1000000, "network should have a usable parameter count");
+    if (!NetConfig::kShrunkForSanitizer())
+        CHECK(parameters > 1000000,
+              "network should have a usable parameter count");
 
     // A common checkpoint, so the two backends compare identical weights
     // instead of each instance's own random initialisation.

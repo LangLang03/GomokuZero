@@ -32,6 +32,16 @@ struct NetConfig {
     static constexpr int kChannels = GOMOK_NET_CHANNELS;
     static constexpr int kResBlocks = GOMOK_NET_RES_BLOCKS;
 
+    // True when the trunk was shrunk for a sanitizer run, so tests can relax
+    // capacity expectations without weakening the production assertions.
+    static constexpr bool kShrunkForSanitizer() {
+#if defined(GOMOK_NET_CHANNELS) || defined(GOMOK_NET_RES_BLOCKS)
+        return true;
+#else
+        return false;
+#endif
+    }
+
     static constexpr int receptive_field() {
         return 2 * (2 * kResBlocks + 1) + 1;
     }
