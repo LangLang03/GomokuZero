@@ -114,14 +114,40 @@ and produced by `tools/export_model.py` from a PyTorch state dict.
 
 ## Network
 
+The shape is defined once in `src/net_config.h`; everything else derives from
+it:
+
 ```
 state [B,4,15,15]                      # stones, opponent, last move, player
-  conv3x3 4->32 relu
-  conv3x3 32->64 relu
-  conv3x3 64->128 relu
-policy: conv1x1 128->4 relu, fc 900->225, log_softmax   -> [B,225]
-value:  conv1x1 128->2 relu, fc 450->64 relu, fc 64->1, tanh -> [B,1]
+  stem:  conv3x3 4->192, bn, relu
+  trunk: 12 x [ conv3x3 192->192, bn, relu,
+                conv3x3 192->192, bn, residual add, relu ]
+policy:  conv1x1 192->2, bn, relu, fc 450->225, log_softmax  -> [B,225]
+value:   conv1x1 192->1, bn, relu, fc 225->64, relu,
+         fc 64->1, tanh                                      -> [B,1]
 ```
+
+**8,100,525** parameters, 98.6% of them in the trunk, receptive field
+spanning the board.
+
+Why this shape (all measured on the previous checkpoint):
+
+| | before | after |
+|---|---|---|
+| parameters | 325,964 | 8,100,525 |
+| trunk share | 28.7% | 98.6% |
+| receptive field | 7x7 (five in a row needs 9x9, so long-range threats were structurally invisible) | 25 convolutions, spans the board |
+| dead trunk channels | 15.6% of conv3 on real positions | residual + batch norm |
+| policy head | `fc 900->225`, 202,500 parameters, no weight sharing | `1x1->2 + fc 450->225`, 101,475 |
+
+**Training requires the LibTorch/CUDA backend.** The native CPU path is
+inference only, so MCTS still works without a GPU and so the two forward
+implementations can be checked against each other.
+
+Weights are stored with batch normalisation folded into the convolution,
+which is exact for inference and is the single on-disk format both backends
+read. Folding is idempotent (`running_var` is loaded as `1 - eps` so the
+fold factor is exactly 1), so repeated save/load cycles do not drift.
 
 ## Tests
 

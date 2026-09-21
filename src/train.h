@@ -39,8 +39,13 @@ struct TrainConfig {
     // symmetries on the fly (see policy_update), so no extra storage.
     bool augment = true;
 
-    // Play games against the current best to get a real strength signal.
-    int eval_games = 0;  // 0 disables the arena
+    // Real strength measurement: play `eval_games` games against a baseline
+    // checkpoint every `eval_freq` batches. Validation loss on human records
+    // only measures agreement with one-hot labels, not playing strength.
+    int eval_games = 0;       // 0 disables the arena
+    int eval_freq = 50;
+    int eval_playout = 100;
+    std::string baseline_dir;
 
     std::string tag = "cpp";
 };
@@ -85,6 +90,7 @@ private:
     void policy_update(int batch_index);
     void log_true_kl(int batch_index);
     void evaluate_and_save(int batch_idx);
+    void run_arena(int batch_idx);
     void validate(int batch_idx);
 };
 

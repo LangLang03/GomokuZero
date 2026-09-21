@@ -942,3 +942,125 @@ BatchedSelfPlay::run_batch(float fixed_temp) {
 }
 
 }  // namespace gomoku
+
+namespace gomoku {
+namespace {
+
+// Single-game MCTS used by the arena. It runs one search at a time, so it can
+// reuse the same select/expand/backup primitives as the batched self-play
+// path without any of the queueing machinery.
+struct ArenaSearch {
+    GameState game;
+    std::vector<LeafTask> tasks;
+    std::mt19937 rng{20240816u};
+
+    explicit ArenaSearch(int playouts, int max_candidates) {
+        const size_t capacity =
+            1 + static_cast<size_t>(playouts) * max_candidates;
+        game.node_capacity = capacity;
+        game.nodes = std::make_unique<GNode[]>(capacity);
+        tasks.resize(static_cast<size_t>(playouts));
+    }
+
+    // Returns the most visited root move.
+    int run(PureNet& net, const Board& board, const SearchConfig& config) {
+        reset_tree(game);
+        game.board = board;
+        std::vector<int> nearby;
+        std::vector<std::pair<float, int>> candidates;
+        std::vector<float> state(4 * BOARD_CELLS);
+        std::vector<float> policy(BOARD_CELLS);
+        float value = 0.0f;
+
+        VirtualLossWeights loss;
+        const float strength = std::max(0.0f, config.virtual_loss);
+        loss.visits = static_cast<int32_t>(std::max(1.0f, std::round(strength)));
+        loss.value_sum = static_cast<int64_t>(
+            std::llround(static_cast<double>(strength) * VALUE_SCALE));
+
+        for (int i = 0; i < config.n_playout; ++i) {
+            LeafTask& task = tasks[static_cast<size_t>(i)];
+            float terminal_value = 0.0f;
+            const SelectionResult selected =
+                select_leaf(game, config.c_puct, task, terminal_value, loss);
+            if (selected == SelectionResult::Retry) continue;
+            if (selected == SelectionResult::Terminal) {
+                backup_path(game, task.path, terminal_value, loss);
+                continue;
+            }
+            game.board.encode_state(state.data());
+            net.forward_batch_policy(state.data(), 1, policy.data(), &value);
+            CachedEvaluation evaluation;
+            evaluation.value = value;
+            std::memcpy(evaluation.policy.data(), policy.data(),
+                        BOARD_CELLS * sizeof(float));
+            expand_leaf(game, task, evaluation, nearby, candidates,
+                        config.max_candidates, config.dirichlet_eps,
+                        config.dirichlet_alpha, rng);
+            backup_path(game, task.path, value, loss);
+        }
+
+        const GNode& root = game.nodes[0];
+        if (root.child_count == 0) return -1;
+        int best = 0;
+        for (int i = 1; i < root.child_count; ++i) {
+            if (game.nodes[root.child_begin + i].visits.load(
+                    std::memory_order_relaxed) >
+                game.nodes[root.child_begin + best].visits.load(
+                    std::memory_order_relaxed))
+                best = i;
+        }
+        return game.nodes[root.child_begin + best].action;
+    }
+};
+
+}  // namespace
+
+MatchResult play_match(PureNet& candidate, PureNet& opponent,
+                       const SearchConfig& config, int games) {
+    MatchResult result;
+    if (games <= 0) return result;
+
+    ArenaSearch candidate_search(config.n_playout, config.max_candidates);
+    ArenaSearch opponent_search(config.n_playout, config.max_candidates);
+
+    // Explore neither side during the arena: we want the strongest move.
+    SearchConfig arena = config;
+    arena.dirichlet_eps = 0.0f;
+    arena.temp_switch_move = 0;
+    arena.temp_high = 0.0f;
+    arena.temp_low = 0.0f;
+
+    for (int g = 0; g < games; ++g) {
+        Board board;
+        // Alternate colours so a first-move bias cannot decide the match.
+        const bool candidate_is_black = (g % 2 == 0);
+        while (true) {
+            const bool black_to_move = board.current_player() == 1;
+            PureNet& mover =
+                (black_to_move == candidate_is_black) ? candidate : opponent;
+            ArenaSearch& search =
+                (black_to_move == candidate_is_black) ? candidate_search
+                                                      : opponent_search;
+            const int move = search.run(mover, board, arena);
+            if (move < 0 || !board.is_empty(move)) break;
+            board.play(move);
+            const int winner = board.winner();
+            if (winner != 0) {
+                result.wins +=
+                    (winner == 1) == candidate_is_black ? 1 : 0;
+                result.losses +=
+                    (winner == 1) == candidate_is_black ? 0 : 1;
+                break;
+            }
+            if (board.move_count() == BOARD_CELLS) {
+                ++result.draws;
+                break;
+            }
+        }
+        ++result.games;
+    }
+    return result;
+}
+
+}  // namespace gomoku

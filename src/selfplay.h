@@ -43,6 +43,25 @@ struct SearchConfig {
     }
 };
 
+// Outcome of an arena match between two models.
+struct MatchResult {
+    int games = 0;
+    int wins = 0;     // first model
+    int losses = 0;   // second model
+    int draws = 0;
+
+    double score() const {
+        // Wins count 1, draws 0.5, matching the usual Elo convention.
+        return games > 0 ? (wins + 0.5 * draws) / games : 0.0;
+    }
+};
+
+// Plays `games` games of `candidate` versus `opponent`, alternating colours.
+// This is the only measurement that reflects playing strength; validation
+// loss on human records measures agreement with human one-hot labels.
+MatchResult play_match(PureNet& candidate, PureNet& opponent,
+                       const SearchConfig& config, int games);
+
 // Batched lock-free MCTS with one inference coordinator.
 class BatchedSelfPlay {
 public:

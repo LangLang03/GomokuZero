@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Export the 15x15 Gomoku policy/value network to a single ONNX file."""
+"""Export the 15x15 Gomoku policy/value network to a single ONNX file.
+
+The PyTorch side loads the raw .bin tensor set written by the C++ trainer.
+That format stores batch normalisation folded into the convolution, so the
+batch-norm modules here are initialised to identity (var = 1 - eps, which
+makes the fold factor exactly 1)."""
 
 import argparse
 import hashlib
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -12,28 +18,120 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+# Mirrors src/net_config.h.
+BOARD = 15
+CELLS = BOARD * BOARD
+CHANNELS = 192
+RES_BLOCKS = 12
+VALUE_HIDDEN = 64
+
+
+class ResBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv_a = nn.Conv2d(CHANNELS, CHANNELS, 3, padding=1)
+        self.bn_a = nn.BatchNorm2d(CHANNELS)
+        self.conv_b = nn.Conv2d(CHANNELS, CHANNELS, 3, padding=1)
+        self.bn_b = nn.BatchNorm2d(CHANNELS)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.relu(self.bn_a(self.conv_a(x)))
+        out = self.bn_b(self.conv_b(out))
+        return F.relu(x + out)
+
 
 class GomokuNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.act_conv1 = nn.Conv2d(128, 4, kernel_size=1)
-        self.act_fc1 = nn.Linear(4 * 15 * 15, 15 * 15)
-        self.val_conv1 = nn.Conv2d(128, 2, kernel_size=1)
-        self.val_fc1 = nn.Linear(2 * 15 * 15, 64)
-        self.val_fc2 = nn.Linear(64, 1)
+        self.stem = nn.Conv2d(4, CHANNELS, 3, padding=1)
+        self.stem_bn = nn.BatchNorm2d(CHANNELS)
+        self.trunk = nn.ModuleList(ResBlock() for _ in range(RES_BLOCKS))
+        self.policy_conv1 = nn.Conv2d(CHANNELS, 2, 1)
+        self.policy_bn = nn.BatchNorm2d(2)
+        self.act_fc1 = nn.Linear(2 * CELLS, CELLS)
+        self.val_conv1 = nn.Conv2d(CHANNELS, 1, 1)
+        self.val_bn = nn.BatchNorm2d(1)
+        self.val_fc1 = nn.Linear(CELLS, VALUE_HIDDEN)
+        self.val_fc2 = nn.Linear(VALUE_HIDDEN, 1)
 
     def forward(self, state: torch.Tensor):
-        trunk = F.relu(self.conv1(state))
-        trunk = F.relu(self.conv2(trunk))
-        trunk = F.relu(self.conv3(trunk))
-        policy = F.relu(self.act_conv1(trunk)).flatten(1)
+        h = F.relu(self.stem_bn(self.stem(state)))
+        for block in self.trunk:
+            h = block(h)
+        policy = F.relu(self.policy_bn(self.policy_conv1(h))).flatten(1)
         log_policy = F.log_softmax(self.act_fc1(policy), dim=1)
-        value = F.leaky_relu(self.val_conv1(trunk), 0.01).flatten(1)
-        value = F.leaky_relu(self.val_fc1(value), 0.01)
+        value = F.relu(self.val_bn(self.val_conv1(h))).flatten(1)
+        value = F.relu(self.val_fc1(value))
         return log_policy, torch.tanh(self.val_fc2(value))
+
+
+def set_identity_batch_norm(module: nn.Module) -> None:
+    """Batch norm already folded into the weights: make it a no-op."""
+    for bn in module.modules():
+        if isinstance(bn, nn.BatchNorm2d):
+            with torch.no_grad():
+                bn.weight.fill_(1.0)
+                bn.bias.zero_()
+                bn.running_mean.zero_()
+                bn.running_var.fill_(1.0 - bn.eps)
+
+
+def layer_shapes() -> dict:
+    shapes = {
+        "stem": ((CHANNELS, 4, 3, 3), (CHANNELS,)),
+        "policy_conv1": ((2, CHANNELS, 1, 1), (2,)),
+        "val_conv1": ((1, CHANNELS, 1, 1), (1,)),
+        "act_fc1": ((CELLS, 2 * CELLS), (CELLS,)),
+        "val_fc1": ((VALUE_HIDDEN, CELLS), (VALUE_HIDDEN,)),
+        "val_fc2": ((1, VALUE_HIDDEN), (1,)),
+    }
+    for i in range(RES_BLOCKS):
+        shapes[f"res{i}_a"] = ((CHANNELS, CHANNELS, 3, 3), (CHANNELS,))
+        shapes[f"res{i}_b"] = ((CHANNELS, CHANNELS, 3, 3), (CHANNELS,))
+    return shapes
+
+
+def load_state_from_bin(directory: Path) -> dict:
+    """Load the raw .bin tensor set written by the C++ trainer.
+
+    Each file is [uint32 count][float32 values...].
+    """
+
+    def read_bin(name: str, shape):
+        path = directory / name
+        with open(path, "rb") as f:
+            (count,) = struct.unpack("<I", f.read(4))
+            data = np.frombuffer(f.read(), dtype="<f4")
+            if len(data) != count:
+                raise ValueError(f"{name}: header {count} != {len(data)} values")
+        return torch.from_numpy(data.reshape(shape).copy())
+
+    state = {}
+    # Only the convolutions carry a batch-norm module.
+    batch_norm_of = {"stem": "stem_bn", "policy_conv1": "policy_bn",
+                     "val_conv1": "val_bn"}
+
+    for layer, (w_shape, b_shape) in layer_shapes().items():
+        if layer.startswith("res"):
+            index = layer[3:layer.index("_")]
+            target = f"trunk.{index}.conv_{layer[-1]}"
+            bn_name = f"trunk.{index}.bn_{layer[-1]}"
+        else:
+            target = layer
+            bn_name = batch_norm_of.get(layer)
+        state[f"{target}.weight"] = read_bin(f"{layer}_weight.bin", w_shape)
+        state[f"{target}.bias"] = read_bin(f"{layer}_bias.bin", b_shape)
+
+        if bn_name is not None:
+            # The convolution already has batch norm folded in, so the module
+            # is a no-op: var = 1 - eps makes the fold factor exactly 1.
+            out_channels = w_shape[0]
+            state[f"{bn_name}.weight"] = torch.ones(out_channels)
+            state[f"{bn_name}.bias"] = torch.zeros(out_channels)
+            state[f"{bn_name}.running_mean"] = torch.zeros(out_channels)
+            state[f"{bn_name}.running_var"] = torch.full((out_channels,),
+                                                         1.0 - 1e-5)
+    return state
 
 
 def load_state(path: Path):
@@ -46,58 +144,31 @@ def load_state(path: Path):
         return state
 
 
-def load_state_from_bin(directory: Path):
-    """Load weights from raw .bin files (C++ trainer's native format).
-
-    Each file: [uint32 count][float32 values...], named <layer>_weight.bin /
-    <layer>_bias.bin, matching tools/export_model.py output.
-    """
-    import struct
-
-    layer_shapes = {
-        "conv1": ((32, 4, 3, 3), (32,)),
-        "conv2": ((64, 32, 3, 3), (64,)),
-        "conv3": ((128, 64, 3, 3), (128,)),
-        "act_conv1": ((4, 128, 1, 1), (4,)),
-        "act_fc1": ((225, 900), (225,)),
-        "val_conv1": ((2, 128, 1, 1), (2,)),
-        "val_fc1": ((64, 450), (64,)),
-        "val_fc2": ((1, 64), (1,)),
-    }
-
-    def read_bin(name: str, shape):
-        path = directory / name
-        with open(path, "rb") as f:
-            (count,) = struct.unpack("<I", f.read(4))
-            data = np.frombuffer(f.read(), dtype="<f4")
-            assert len(data) == count, f"{name}: count {count} != data {len(data)}"
-        return torch.from_numpy(data.reshape(shape))
-
-    state = {}
-    for layer, (w_shape, b_shape) in layer_shapes.items():
-        state[f"{layer}.weight"] = read_bin(f"{layer}_weight.bin", w_shape)
-        state[f"{layer}.bias"] = read_bin(f"{layer}_bias.bin", b_shape)
-    return state
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=Path)
+    parser.add_argument("source", type=Path, nargs="?", default=None)
     parser.add_argument("output", type=Path)
     parser.add_argument(
         "--bin-dir",
         type=Path,
         default=None,
-        help="load weights from a directory of raw .bin files instead of source",
+        help="load weights from the C++ trainer's .bin directory",
     )
     args = parser.parse_args()
 
     model = GomokuNet().eval()
     if args.bin_dir is not None:
         model.load_state_dict(load_state_from_bin(args.bin_dir), strict=True)
-    else:
+        set_identity_batch_norm(model)
+    elif args.source is not None:
         model.load_state_dict(load_state(args.source), strict=True)
-    example = torch.zeros(1, 4, 15, 15, dtype=torch.float32)
+    else:
+        parser.error("provide either a checkpoint or --bin-dir")
+
+    parameters = sum(p.numel() for p in model.parameters())
+    print(f"parameters: {parameters:,}")
+
+    example = torch.zeros(1, 4, BOARD, BOARD, dtype=torch.float32)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         model,
@@ -118,15 +189,20 @@ def main() -> None:
 
     exported = onnx.load(args.output)
     onnx.checker.check_model(exported)
-    source_sha = (
-        hashlib.sha256(b"".join(p.read_bytes() for p in sorted(args.bin_dir.glob("*.bin")))).hexdigest()
-        if args.bin_dir is not None
-        else hashlib.sha256(args.source.read_bytes()).hexdigest()
-    )
+    if args.bin_dir is not None:
+        source_sha = hashlib.sha256(
+            b"".join(p.read_bytes() for p in sorted(args.bin_dir.glob("*.bin")))
+        ).hexdigest()
+        source = str(args.bin_dir)
+    else:
+        source_sha = hashlib.sha256(args.source.read_bytes()).hexdigest()
+        source = str(args.source)
     metadata = {
-        "source": str(args.bin_dir if args.bin_dir is not None else args.source),
+        "source": source,
         "source_sha256": source_sha,
-        "board_size": "15x15",
+        "board_size": f"{BOARD}x{BOARD}",
+        "channels": str(CHANNELS),
+        "res_blocks": str(RES_BLOCKS),
         "policy_output": "log_softmax",
     }
     del exported.metadata_props[:]
@@ -137,9 +213,9 @@ def main() -> None:
     onnx.save(exported, args.output)
 
     rng = np.random.default_rng(20260814)
-    test_input = np.zeros((3, 4, 15, 15), dtype=np.float32)
+    test_input = np.zeros((3, 4, BOARD, BOARD), dtype=np.float32)
     for batch in range(3):
-        occupied = rng.choice(15 * 15, size=20 + batch * 7, replace=False)
+        occupied = rng.choice(CELLS, size=20 + batch * 7, replace=False)
         split = (len(occupied) + 1) // 2
         test_input[batch, 0].flat[occupied[:split]] = 1.0
         test_input[batch, 1].flat[occupied[split:]] = 1.0

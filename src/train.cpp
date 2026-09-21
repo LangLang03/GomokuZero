@@ -355,6 +355,29 @@ void Trainer::evaluate_and_save(int batch_idx) {
     logger.log("[train] batch %d model saved (%s)", batch_idx, dir.c_str());
 }
 
+void Trainer::run_arena(int batch_idx) {
+    if (config_.eval_games <= 0 || config_.baseline_dir.empty()) return;
+
+    // The baseline runs on the native CPU path: its games need far fewer
+    // evaluations than self-play, and this avoids holding two CUDA contexts.
+    PureNet baseline(2e-3);
+    if (!baseline.load(config_.baseline_dir)) {
+        logger.log("[arena] baseline load failed (%s); skipping",
+                   config_.baseline_dir.c_str());
+        return;
+    }
+    baseline.set_cuda_enabled(false);
+    baseline.set_inference_threads(1);
+
+    SearchConfig arena = search_;
+    arena.n_playout = std::max(1, config_.eval_playout);
+    const MatchResult result =
+        play_match(net_, baseline, arena, config_.eval_games);
+    logger.log("[arena] batch %d | vs %s | %dW %dL %dD | score %.3f",
+               batch_idx, config_.baseline_dir.c_str(), result.wins,
+               result.losses, result.draws, result.score());
+}
+
 void Trainer::run() {
     BatchedSelfPlay sp(net_, search_);
     auto t0 = std::chrono::steady_clock::now();
@@ -386,6 +409,8 @@ void Trainer::run() {
         }
         if ((i + 1) % config_.check_freq == 0) evaluate_and_save(i + 1);
         if ((i + 1) % 5 == 0) validate(i + 1);
+        if (config_.eval_freq > 0 && (i + 1) % config_.eval_freq == 0)
+            run_arena(i + 1);
     }
     evaluate_and_save(config_.game_batch_num);
 }

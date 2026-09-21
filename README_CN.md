@@ -98,28 +98,65 @@ GOMOK_PROFILE=1 GOMOK_SEED=1 ./build/gomoku_train selfplay \
 
 ### 模型格式
 
-权重存放在目录下的 16 个 `.bin` 文件里（`conv1_weight.bin`、`act_fc1_bias.bin` 等），
-每文件为 `[u32 数量][float32 数据...]`。C++ 引擎读写同一格式，
-`tools/export_model.py` 可从 PyTorch state_dict 生成；
-`tools/export_onnx.py` 导出单文件 ONNX（输入 `state` [B,4,15,15]；输出
-`log_policy` [B,225]、`value` [B,1]）。
+权重按张量存放在目录下（`stem_weight.bin`、`res0_a_weight.bin`、
+`act_fc1_bias.bin` 等），每文件为 `[u32 数量][float32 数据...]`。
+
+**批归一化已折合进卷积**，这是磁盘上的唯一格式，CUDA 与 CPU 两条路径读同一份
+文件。折合对推理是精确等价的仿射改写，且是幂等的：加载时把
+`running_var` 设为 `1 - eps`，使折合系数恰好为 1，因此反复保存/加载不会
+累积漂移（由 `gomoku_backend_parity` 的往返检查覆盖）。
+
+`tools/export_onnx.py --bin-dir <目录>` 导出单文件 ONNX（输入
+`state` [B,4,15,15]；输出 `log_policy` [B,225]、`value` [B,1]）。
 
 ## 网络结构
 
+结构集中定义在 `src/net_config.h`，其余代码由它派生：
+
 ```
 state [B,4,15,15]                      # 己方、对方、最后一手、执子方
-  conv3x3 4->32 relu
-  conv3x3 32->64 relu
-  conv3x3 64->128 relu
-policy: conv1x1 128->4 relu, fc 900->225, log_softmax   -> [B,225]
-value:  conv1x1 128->2 relu, fc 450->64 relu, fc 64->1, tanh -> [B,1]
+  stem:  conv3x3 4->192, bn, relu
+  trunk: 12 x [ conv3x3 192->192, bn, relu,
+                conv3x3 192->192, bn, 残差相加, relu ]
+policy:  conv1x1 192->2, bn, relu, fc 450->225, log_softmax  -> [B,225]
+value:   conv1x1 192->1, bn, relu, fc 225->64, relu,
+         fc 64->1, tanh                                      -> [B,1]
 ```
+
+共 **8,100,525** 参数，主干占 98.6%，感受野覆盖整个棋盘。
+
+改动理由（均为实测）：
+
+| 项目 | 旧 | 新 |
+|---|---|---|
+| 参数量 | 325,964 | 8,100,525 |
+| 主干占比 | 28.7% | 98.6% |
+| 感受野 | 7x7（判定五连需 9x9，**看不见长程威胁**） | 25 层卷积，覆盖全盘 |
+| 主干死通道 | conv3 实测 15.6%（20/128） | 残差 + BN |
+| 策略头 | `fc 900->225`，202,500 参数、无空间权重共享 | `1x1->2 + fc 450->225`，101,475 参数 |
+
+**训练只走 LibTorch/CUDA 后端**；原生 CPU 路径只做推理（MCTS 用），
+用来在没有 CUDA 时仍可对弈，并作为与 LibTorch 的数值对照。
 
 ## 测试
 
-- `gomoku_smoke` — 优化卷积 vs 朴素参考、快/量化推理 vs 慢推理一致性、胜负/悔棋、自对弈全流程。
+- `gomoku_smoke` — 棋盘四方向五连与悔棋、网络输出归一化、自对弈目标分布合理性。
 - `gomoku_game_test` — 棋盘规则：四方向五连、悔棋、状态编码。
-- `gomoku_gradient_test` — 手写反向传播 vs 数值差分。
+- `gomoku_gradient_test` — 手写卷积/全连接反向传播 vs 数值差分。
+- `gomoku_backend_parity` — 同一权重下原生 CPU 前向 vs LibTorch 前向必须选出同一步棋
+  （实测 0/8 argmax 不一致，log 空间最大偏差 1.7e-03）。
+
+### Sanitizer
+
+`-DGOMOK_SANITIZER=` 可开启 ASan / UBSan / TSan。选中 `thread` 时 CMake 会自动
+关闭 LibTorch 后端（CUDA 运行时与 TSan 不兼容）：
+
+```sh
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DGOMOK_ENABLE_CUDA=OFF -DGOMOK_SANITIZER=thread
+cmake --build build-tsan -j
+ctest --test-dir build-tsan --output-on-failure
+```
 
 ```sh
 ctest --test-dir build --output-on-failure

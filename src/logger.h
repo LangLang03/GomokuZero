@@ -1,39 +1,29 @@
 #pragma once
-#include <string>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <atomic>
 #include <cstdarg>
+#include <cstdio>
+#include <string>
 
 namespace gomoku {
 
-// Training logger. log() flushes completed lines immediately.
-class AsyncLogger {
+// Training logger. Writes to stdout, and additionally to the file named by
+// the GOMOK_LOG_FILE environment variable when set.
+//
+// The earlier implementation started a worker thread and polled a queue that
+// log() never filled: the thread did nothing and every call wrote to stdout
+// directly. This keeps the direct write and adds the optional file sink.
+class Logger {
 public:
-    AsyncLogger() { worker_ = std::thread(&AsyncLogger::run, this); }
-    ~AsyncLogger() {
-        stop_ = true;
-        cv_.notify_all();
-        if (worker_.joinable()) worker_.join();
-        flush();
-    }
+    Logger();
+    ~Logger();
 
-    // printf-style
-    void log(const char* fmt, ...);
+    // printf-style.
+    void log(const char* format, ...);
 
 private:
-    void run();
-    void flush();
-
-    std::queue<std::string> queue_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::thread worker_;
-    std::atomic<bool> stop_{false};
+    std::FILE* file_ = nullptr;
+    bool owns_file_ = false;
 };
 
-extern AsyncLogger logger;
+extern Logger logger;
 
 }  // namespace gomoku

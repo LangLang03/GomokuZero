@@ -21,7 +21,8 @@ static void print_usage() {
         "         [--lr 2e-3] [--lr-final-fraction 0.1] [--lr-warmup 2]\n"
         "         [--weight-decay 1e-4] [--grad-clip 2.0]\n"
         "         [--label-smooth 0.1] [--value-loss-weight 1.0]\n"
-        "         [--augment 0|1] [--eval-games N]\n"
+        "         [--augment 0|1] [--eval-games N] [--eval-freq N]\n"
+        "         [--eval-playout N] [--baseline DIR]\n"
         "         [--c-puct 5.0] [--temp-high 1.0] [--temp-low 0.5]\n"
         "         [--temp-switch 30] [--dirichlet-eps 0.25]\n"
         "         [--dirichlet-alpha 0.3] [--max-candidates 60]\n"
@@ -73,6 +74,9 @@ int cmd_train(int argc, char** argv) {
         else if (a == "--value-loss-weight") { train.value_loss_weight = next_double(); }
         else if (a == "--augment") { train.augment = next_int() != 0; }
         else if (a == "--eval-games") { train.eval_games = next_int(); }
+        else if (a == "--eval-freq") { train.eval_freq = next_int(); }
+        else if (a == "--eval-playout") { train.eval_playout = next_int(); }
+        else if (a == "--baseline") { if (i+1<argc) train.baseline_dir = argv[++i]; }
         // Search / self-play.
         else if (a == "--c-puct") { search.c_puct = next_float(); }
         else if (a == "--temp-high") { search.temp_high = next_float(); }
