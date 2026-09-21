@@ -305,6 +305,10 @@ void Trainer::policy_update(int batch_index) {
 
 void Trainer::update_kl_probe() {
     if (n_kl_ <= 0) return;
+    // The buffers must be sized here: nothing else allocates them, and passing
+    // an empty vector's data() to forward_batch dereferences a null pointer.
+    const size_t size = static_cast<size_t>(n_kl_) * BOARD_CELLS;
+    kl_before_.assign(size, 0.0f);
     std::vector<float> value(static_cast<size_t>(n_kl_));
     net_.forward_batch(kl_states_.data(), n_kl_, kl_before_.data(),
                        value.data());
@@ -403,7 +407,17 @@ void Trainer::run() {
     auto t0 = std::chrono::steady_clock::now();
     auto t_last = t0;
 
-    for (int i = 0; i < config_.game_batch_num; ++i) {
+    // Resuming must continue the schedule, not restart it. The learning rate is
+    // a function of the absolute batch index, so picking up from the checkpoint
+    // keeps the decay where it left off and avoids re-running warmup.
+    const int start_batch = std::min(net_.resume_batch_index(),
+                                     config_.game_batch_num);
+    if (start_batch > 0) {
+        logger.log("[train] resuming at batch %d/%d (lr %.6f)", start_batch,
+                   config_.game_batch_num, learning_rate_for_batch(start_batch));
+    }
+
+    for (int i = start_batch; i < config_.game_batch_num; ++i) {
         // Negative override: use the configured temperature schedule.
         auto batches = sp.run_batch(-1.0f);
         add_samples(batches);

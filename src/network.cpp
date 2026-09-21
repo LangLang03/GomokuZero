@@ -348,15 +348,30 @@ void PureNet::forward_one(const std::vector<float>& state,
     forward_batch_impl(state.data(), 1, log_policy.data(), &value, false);
 }
 
+namespace {
+
+// Rejects null buffers explicitly. A caller that passes an unsized vector's
+// data() would otherwise get a segfault deep inside the backend with no hint
+// about which argument was wrong.
+void require_buffers(const float* states, float* policy, float* value) {
+    if (states == nullptr || policy == nullptr || value == nullptr)
+        throw std::invalid_argument(
+            "forward_batch requires non-null state, policy and value buffers");
+}
+
+}  // namespace
+
 void PureNet::forward_batch(const float* states, int B, float* log_policy,
                             float* value) const {
     if (B <= 0) return;
+    require_buffers(states, log_policy, value);
     forward_batch_impl(states, B, log_policy, value, false);
 }
 
 void PureNet::forward_batch_policy(const float* states, int B, float* policy,
                                    float* value) const {
     if (B <= 0) return;
+    require_buffers(states, policy, value);
     forward_batch_impl(states, B, policy, value, true);
 }
 

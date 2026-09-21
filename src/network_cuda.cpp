@@ -239,6 +239,9 @@ struct CudaNetworkBackend::Impl {
     // Set once any optimisation step has run, so a backend switch that would
     // discard training state can be refused rather than silently corrupting.
     bool trained = false;
+    // LibTorch's C++ Adam does not expose its step counter, so it is tracked
+    // here for the checkpoint metadata.
+    int64_t step_count = 0;
 };
 
 CudaNetworkBackend::CudaNetworkBackend(PureNet& owner, double learning_rate)
@@ -442,21 +445,35 @@ bool CudaNetworkBackend::save_training_state(
     });
     if (!ok) return false;
 
+    // The optimiser holds the Adam moments. Resuming without them restarts the
+    // moment estimates from zero, which changes the effective step size for
+    // thousands of updates, so they are part of the checkpoint.
+    int64_t saved_step = step;
+    if (impl_->optimizer) {
+        try {
+            torch::serialize::OutputArchive archive;
+            impl_->optimizer->save(archive);
+            archive.save_to(directory + "/training_optimizer.pt");
+            if (saved_step == 0) saved_step = impl_->step_count;
+        } catch (const c10::Error& error) {
+            std::cerr << "[net] optimiser state save failed: "
+                      << error.what_without_backtrace() << '\n';
+            ok = false;
+        }
+    }
+    if (!ok) return false;
+
     std::ofstream meta(directory + "/training.meta");
     if (!meta.is_open()) return false;
-    meta << "version 1\n";
+    meta << "version 2\n";
     meta << "batch_index " << batch_index << "\n";
-    meta << "optimizer_step " << step << "\n";
+    meta << "optimizer_step " << saved_step << "\n";
     meta << "conv_count " << tensor_index << "\n";
     meta << "fc_count " << fc_index << "\n";
+    // Retained so a version-1 reader still sees the keys it expects.
     meta << "moments_m " << moments_m.size() << "\n";
     meta << "moments_v " << moments_v.size() << "\n";
     meta.close();
-    if (!moments_m.empty())
-        ok = write_bin(directory + "/training_moments_m.bin", moments_m);
-    if (ok && !moments_v.empty())
-        ok = write_bin(directory + "/training_moments_v.bin", moments_v);
-    if (!ok) return false;
 
     // The inference export travels with the checkpoint so MCTS and `human`
     // can consume the same directory.
@@ -474,7 +491,7 @@ bool CudaNetworkBackend::load_training_state(
     int64_t optimizer_step = 0;
     size_t m_size = 0, v_size = 0;
     meta >> key >> version;
-    if (version != 1) return false;
+    if (version != 1 && version != 2) return false;
     meta >> key >> batches;
     meta >> key >> optimizer_step;
     meta >> key >> conv_count;
@@ -532,6 +549,26 @@ bool CudaNetworkBackend::load_training_state(
     });
     if (!ok) return false;
 
+    // Restoring the moment estimates requires the parameters to be in place,
+    // which they now are.
+    if (impl_->optimizer) {
+        const std::string optimizer_path = directory + "/training_optimizer.pt";
+        std::ifstream probe(optimizer_path);
+        if (probe.is_open()) {
+            probe.close();
+            try {
+                torch::serialize::InputArchive archive;
+                archive.load_from(optimizer_path);
+                impl_->optimizer->load(archive);
+            } catch (const c10::Error& error) {
+                std::cerr << "[net] optimiser state load failed: "
+                          << error.what_without_backtrace() << '\n';
+                return false;
+            }
+        }
+    }
+
+    impl_->step_count = optimizer_step;
     if (batch_index != nullptr) *batch_index = batches;
     if (step != nullptr) *step = optimizer_step;
     if (moments_m != nullptr && m_size > 0) {
@@ -583,6 +620,7 @@ PureNet::TrainStats CudaNetworkBackend::train_step(
         torch::nn::utils::clip_grad_norm_(impl_->net->parameters(), clip);
     impl_->optimizer->step();
     impl_->trained = true;
+    ++impl_->step_count;
     const auto entropy = -torch::mean(
         torch::sum(torch::exp(log_policy) * log_policy, 1));
 

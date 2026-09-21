@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 using namespace gomoku;
@@ -183,6 +184,32 @@ int main() {
                          std::abs(static_cast<double>(root_log[i]) - leaf_log[i]));
         CHECK(max_difference > 1e-6,
               "network output must differ between distinct positions");
+    }
+
+    // --- Null buffers must be rejected, not dereferenced ----------------
+    {
+        // A caller that forgets to size a buffer passes data() == nullptr.
+        // That used to segfault inside the backend (found via the KL probe,
+        // which passed an unallocated vector); it must now fail loudly.
+        PureNet net;
+        std::vector<float> states(4 * BOARD_CELLS, 0.0f);
+        std::vector<float> value(1, 0.0f);
+
+        bool threw = false;
+        try {
+            net.forward_batch(states.data(), 1, nullptr, value.data());
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw, "a null policy buffer must raise invalid_argument");
+
+        threw = false;
+        try {
+            net.forward_batch(nullptr, 1, value.data(), value.data());
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw, "a null state buffer must raise invalid_argument");
     }
 
     std::printf("regression %s\n", failures == 0 ? "passed" : "FAILED");
