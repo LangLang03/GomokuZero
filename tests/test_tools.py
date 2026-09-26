@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -352,6 +353,39 @@ class ExportTests(unittest.TestCase):
             onnx.save(exported, output)
             with self.assertRaisesRegex(ValueError, 'rules'):
                 ONNXEngine(output)
+
+    @unittest.skipUnless(importlib.util.find_spec('onnxruntime'), 'ONNX Runtime is optional')
+    def test_cuda_session_preloads_libraries_before_creating_the_session(self):
+        import onnxruntime as ort
+        import gomoku
+        order = []
+        session = mock.MagicMock()
+        session.get_providers.return_value = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session.get_modelmeta.return_value.custom_metadata_map = {
+            'rules': 'freestyle', 'board_size': '15x15'}
+        with mock.patch.object(gomoku, '_CUDA_LIBRARIES_LOADED', False), \
+                mock.patch.object(ort, 'get_available_providers',
+                                  return_value=['CUDAExecutionProvider', 'CPUExecutionProvider']), \
+                mock.patch.object(ort, 'preload_dlls',
+                                  side_effect=lambda *a, **k: order.append('preload'), create=True), \
+                mock.patch.object(ort, 'InferenceSession',
+                                  side_effect=lambda *a, **k: order.append('session') or session):
+            engine = gomoku.ONNXEngine('unused.onnx', device='cuda')
+        self.assertEqual(order, ['preload', 'session'])
+        self.assertEqual(engine.provider, 'CUDAExecutionProvider')
+
+    @unittest.skipUnless(importlib.util.find_spec('onnxruntime'), 'ONNX Runtime is optional')
+    def test_explicit_cuda_device_rejects_a_cpu_only_session(self):
+        import onnxruntime as ort
+        import gomoku
+        session = mock.MagicMock()
+        session.get_providers.return_value = ['CPUExecutionProvider']
+        with mock.patch.object(gomoku, '_CUDA_LIBRARIES_LOADED', True), \
+                mock.patch.object(ort, 'get_available_providers',
+                                  return_value=['CUDAExecutionProvider', 'CPUExecutionProvider']), \
+                mock.patch.object(ort, 'InferenceSession', return_value=session):
+            with self.assertRaisesRegex(RuntimeError, 'fell back to CPUExecutionProvider'):
+                gomoku.ONNXEngine('unused.onnx', device='cuda')
 
 
 if __name__ == '__main__':

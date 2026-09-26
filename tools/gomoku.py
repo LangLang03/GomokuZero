@@ -184,6 +184,38 @@ class MCTS:
         return int(np.random.choice(actions, p=probs/probs.sum()))
 
 
+_CUDA_LIBRARIES_LOADED = False
+
+
+def _load_cuda_libraries(ort):
+    """Make the CUDA/cuDNN libraries the onnxruntime CUDA provider links against loadable.
+
+    ``pip install onnxruntime-gpu[cuda,cudnn]`` installs CUDA 13 under
+    ``site-packages/nvidia/cu13/lib`` (CUDA 12 uses ``nvidia/<component>/lib``) and never
+    puts it on the dynamic loader path. The CUDA provider then fails to load with
+    "libcublasLt.so.13: cannot open shared object file", and ONNX Runtime silently keeps
+    only the CPU provider. Loading the libraries into this process lets the provider
+    resolve them: ONNX Runtime's own helper does this for the nvidia site-packages it
+    knows about, and importing a CUDA-matching torch first is the documented alternative
+    for releases without the helper.
+    """
+    global _CUDA_LIBRARIES_LOADED
+    if _CUDA_LIBRARIES_LOADED:
+        return
+    _CUDA_LIBRARIES_LOADED = True
+    preload = getattr(ort, 'preload_dlls', None)
+    if preload is not None:
+        try:
+            preload()
+        except Exception as error:
+            print(f'warning: onnxruntime.preload_dlls() failed: {error}')
+        return
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
+
+
 class ONNXEngine:
     def __init__(self, model_path, c_puct=5, n_playout=200, device='auto'):
         import onnxruntime as ort
@@ -198,6 +230,10 @@ class ONNXEngine:
         if device == 'cpu':
             providers = ['CPUExecutionProvider']
         elif has_cuda:
+            # get_available_providers() lists compiled-in providers even when their
+            # shared libraries cannot be loaded, so the libraries must be resident
+            # before the session is created.
+            _load_cuda_libraries(ort)
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         else:
             providers = ['CPUExecutionProvider']
@@ -210,6 +246,14 @@ class ONNXEngine:
             # cannot initialize the current device. Explicit --device cuda never does.
             self.session = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
         self.provider = self.session.get_providers()[0]
+        if device == 'cuda' and self.provider != 'CUDAExecutionProvider':
+            # A failed CUDA provider is a warning, not an error, inside onnxruntime:
+            # the session would otherwise run on CPU while the caller asked for CUDA.
+            raise RuntimeError(
+                f'CUDAExecutionProvider was requested but the session fell back to {self.provider}; '
+                f'the CUDA {getattr(ort, "cuda_version", "")} runtime it was built against is not '
+                'loadable (pip install "onnxruntime-gpu[cuda,cudnn]", or set LD_LIBRARY_PATH to a '
+                'matching CUDA toolkit)')
         metadata = self.session.get_modelmeta().custom_metadata_map
         if metadata.get('rules', 'freestyle') != 'freestyle':
             raise ValueError('ONNX model rules must match freestyle Gomoku')
