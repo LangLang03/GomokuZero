@@ -30,71 +30,59 @@ static int failures = 0;
         }                                                                     \
     } while (0)
 
-namespace {
-
-// Reproduces the self-play target construction: MCTS visit weights on the root
-// children, then the smoothing pass.
-void spread_with_smoothing(const Board& root,
-                           const std::vector<std::pair<int, float>>& visits,
-                           float smooth, std::vector<float>& probs) {
-    probs.assign(BOARD_CELLS, 0.0f);
-    float total = 0.0f;
-    for (const auto& [move, weight] : visits) {
-        probs[static_cast<size_t>(move)] = weight;
-        total += weight;
-    }
-    if (total > 0.0f)
-        for (float& p : probs) p /= total;
-
-    if (smooth <= 0.0f) return;
-    int legal_count = 0;
-    for (int m = 0; m < BOARD_CELLS; ++m)
-        if (root.is_empty(m)) ++legal_count;
-    if (legal_count == 0) return;
-    const float spread = smooth / static_cast<float>(legal_count);
-    for (int m = 0; m < BOARD_CELLS; ++m) {
-        probs[static_cast<size_t>(m)] =
-            root.is_empty(m) ? probs[static_cast<size_t>(m)] * (1.0f - smooth) + spread
-                             : 0.0f;
-    }
-}
-
-}  // namespace
-
 int main() {
-    // --- P0-04: smoothing must not touch occupied cells -------------------
+    // Exercise the actual concurrent self-play target path, including later
+    // positions, illegal-cell masking, normalization and terminal value signs.
     {
-        Board board;
-        // A mid-game position with plenty of stones on the board.
-        const int moves[] = {112, 113, 127, 128, 97, 98, 143, 142, 82, 83};
-        for (int m : moves) board.play(m);
-
-        std::vector<float> probs;
-        spread_with_smoothing(board, {{99, 0.6f}, {100, 0.3f}, {101, 0.1f}},
-                              0.05f, probs);
-
-        int occupied_with_mass = 0;
-        double sum = 0.0;
-        for (int m = 0; m < BOARD_CELLS; ++m) {
-            sum += probs[static_cast<size_t>(m)];
-            if (!board.is_empty(m) && probs[static_cast<size_t>(m)] != 0.0f)
-                ++occupied_with_mass;
+        PureNet net;
+        SearchConfig config;
+        config.n_playout = 8;
+        config.batch_games = 2;
+        config.n_threads = 2;
+        config.max_candidates = 8;
+        config.unseen_move_smooth = 0.05f;
+        BatchedSelfPlay selfplay(net, config);
+        const auto games = selfplay.run_batch(1.0f);
+        CHECK(games.size() == 2, "self-play returns each requested game");
+        for (const auto& samples : games) {
+            Board replay;
+            CHECK(!samples.empty(), "self-play game contains training samples");
+            for (size_t ply = 0; ply < samples.size(); ++ply) {
+                const auto& sample = samples[ply];
+                std::array<float, 4 * BOARD_CELLS> expected{};
+                replay.encode_state(expected.data());
+                CHECK(expected == sample.state, "stored state matches replayed trajectory");
+                double total = 0.0;
+                for (int move = 0; move < BOARD_CELLS; ++move) {
+                    const float p = sample.probs[move];
+                    CHECK(std::isfinite(p) && p >= 0.0f, "policy target is finite/nonnegative");
+                    CHECK(replay.is_empty(move) || p == 0.0f, "policy target masks illegal moves");
+                    total += p;
+                }
+                CHECK(std::abs(total - 1.0) < 1e-5, "actual search target normalizes");
+                if (ply + 1 < samples.size()) {
+                    int played = -1;
+                    for (int move = 0; move < BOARD_CELLS; ++move)
+                        if (samples[ply + 1].state[2 * BOARD_CELLS + move] == 1.0f)
+                            played = move;
+                    CHECK(played >= 0 && replay.is_empty(played), "trajectory contains legal next move");
+                    if (played >= 0 && replay.is_empty(played)) replay.play(played);
+                    CHECK(sample.z == -samples[ply + 1].z,
+                          "value targets alternate player perspective");
+                } else {
+                    bool terminal_found = false;
+                    for (int move : replay.legal_moves()) {
+                        replay.play(move);
+                        if (replay.game_over()) {
+                            const float expected_z = replay.winner() == 0 ? 0.0f : 1.0f;
+                            if (sample.z == expected_z) terminal_found = true;
+                        }
+                        replay.undo();
+                    }
+                    CHECK(terminal_found, "last sample has a reachable terminal outcome");
+                }
+            }
         }
-        CHECK(occupied_with_mass == 0,
-              "self-play smoothing assigned probability to occupied cells");
-        CHECK(std::abs(sum - 1.0) < 1e-3, "smoothed target must still sum to 1");
-
-        // Every legal cell must retain some mass, which is the point of the
-        // smoothing in the first place.
-        int legal_with_mass = 0;
-        int legal_total = 0;
-        for (int m = 0; m < BOARD_CELLS; ++m) {
-            if (!board.is_empty(m)) continue;
-            ++legal_total;
-            if (probs[static_cast<size_t>(m)] > 0.0f) ++legal_with_mass;
-        }
-        CHECK(legal_with_mass == legal_total,
-              "every legal move must keep some probability mass");
     }
 
     // --- P0-02: the KL diagnostic must not change the model ---------------
@@ -147,52 +135,105 @@ int main() {
               "search_best_move must not modify the caller's board");
     }
 
-    // --- P0-01: the arena must evaluate distinct leaf positions -----------
+    // Observe the actual evaluator inputs: the root is evaluated only once,
+    // while subsequent calls see the selected leaf with its correct player.
     {
-        // Two different boards must produce different network inputs, which is
-        // what the arena failed to do when it encoded the root every time.
         Board root;
         root.play(112);
         root.play(113);
+        SearchConfig config;
+        config.n_playout = 12;
+        int root_evaluations = 0;
+        int leaf_evaluations = 0;
+        const int move = search_best_move(root, config,
+            [&](const Board& leaf, std::array<float, BOARD_CELLS>& policy, float& value) {
+                if (leaf.position_key() == root.position_key()) ++root_evaluations;
+                else ++leaf_evaluations;
+                CHECK(leaf.move_count() >= root.move_count(), "evaluations descend from root");
+                CHECK(leaf.current_player() == (leaf.move_count() % 2 + 1),
+                      "evaluator receives the leaf side to move");
+                policy.fill(1.0f / BOARD_CELLS);
+                value = 0.0f;
+            });
+        CHECK(root.is_empty(move), "observable search selects legal action");
+        CHECK(root_evaluations == 1 && leaf_evaluations == config.n_playout - 1,
+              "MCTS evaluates each selected leaf, not a repeated root position");
+    }
 
-        Board leaf = root;
-        leaf.play(98);
-        leaf.play(99);
+    // A zero prior stays zero when other legal moves have positive mass.
+    // The old normalizer substituted 1 / sum for zero entries, which could
+    // make a zero-probability move more attractive than the entire policy.
+    {
+        SearchConfig config;
+        config.n_playout = 2;
+        config.max_candidates = 2;
+        Board root;
+        root.play(112);
+        const int move = search_best_move(root, config,
+            [](const Board&, std::array<float, BOARD_CELLS>& policy, float& value) {
+                policy.fill(0.0f);
+                policy[113] = 0.01f;
+                value = 0.0f;
+            });
+        CHECK(move == 113, "zero priors do not gain mass during normalization");
+    }
 
-        std::vector<float> root_state(4 * BOARD_CELLS);
-        std::vector<float> leaf_state(4 * BOARD_CELLS);
-        root.encode_state(root_state.data());
-        leaf.encode_state(leaf_state.data());
+    // Scripted values favor root move 16 and lose after root move 17.
+    // They alternate sign with depth; a sign error in backup/selection chooses
+    // the losing move even though both priors and the evaluator are controlled.
+    {
+        Board root;
+        root.play(0);
+        root.play(1);
+        SearchConfig config;
+        config.n_playout = 24;
+        config.max_candidates = 2;
+        config.c_puct = 1.0f;
+        const int move = search_best_move(root, config,
+            [&](const Board& leaf, std::array<float, BOARD_CELLS>& policy, float& value) {
+                policy.fill(0.0f);
+                policy[16] = 0.5f;
+                policy[17] = 0.5f;
+                if (leaf.move_count() == root.move_count()) value = 0.0f;
+                else {
+                    const float root_value = leaf.move_at(root.move_count()) == 16 ? 1.0f : -1.0f;
+                    value = leaf.current_player() == root.current_player()
+                        ? root_value : -root_value;
+                }
+            });
+        CHECK(move == 16, "MCTS backs up values with alternating player signs");
+    }
 
-        bool differs = false;
-        for (size_t i = 0; i < root_state.size(); ++i)
-            if (root_state[i] != leaf_state[i]) { differs = true; break; }
-        CHECK(differs,
-              "a leaf position must encode differently from the root; encoding "
-              "the root for every leaf makes MCTS evaluate the wrong position");
-
-        // And the network must actually respond to that difference. Compare
-        // the near-empty board against a full one, so the distinction is large
-        // enough for any trunk size to resolve (a sanitizer build shrinks it).
-        Board full;
-        const int opening[] = {112, 113, 127, 128, 97, 98, 143, 142, 82, 83,
-                               67, 68, 52, 53, 37, 38, 22, 23, 7, 8};
-        for (int m : opening) full.play(m);
-        std::vector<float> full_state(4 * BOARD_CELLS);
-        full.encode_state(full_state.data());
-
+    // Tactical wins/blocks survive the most aggressive candidate cap.
+    {
         PureNet net;
-        std::vector<float> root_log, full_log;
-        float root_value = 0.0f, full_value = 0.0f;
-        net.forward_one(root_state, root_log, root_value);
-        net.forward_one(full_state, full_log, full_value);
-        double max_difference = 0.0;
-        for (size_t i = 0; i < root_log.size(); ++i)
-            max_difference =
-                std::max(max_difference,
-                         std::abs(static_cast<double>(root_log[i]) - full_log[i]));
-        CHECK(max_difference > 1e-6,
-              "network output must differ between distinct positions");
+        SearchConfig config;
+        config.n_playout = 2;
+        config.max_candidates = 1;
+        Board win;
+        for (int move : {0, 30, 1, 32, 2, 34, 3, 36}) win.play(move);
+        CHECK(search_best_move(net, win, config) == 4,
+              "immediate winning action survives cap and beats arbitrary priors");
+        win.play(4);
+        CHECK(search_best_move(net, win, config) == -1, "terminal board has no search action");
+        Board block;
+        for (int move : {30, 0, 32, 1, 34, 2, 36, 3}) block.play(move);
+        CHECK(search_best_move(net, block, config) == 4,
+              "unique immediate opponent win is blocked");
+
+        config.n_playout = 1;
+        config.max_candidates = 4;
+        config.eval_opening_moves = 4;
+        const MatchResult match = play_match(net, net, config, 4);
+        CHECK(match.games == 4 && match.wins == match.losses,
+              "identical models tie on colour-swapped opening pairs");
+        CHECK(match.games == match.wins + match.losses + match.draws,
+              "arena accounts for every requested game");
+        config.max_candidates = 0;
+        bool rejected = false;
+        try { BatchedSelfPlay invalid(net, config); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected, "zero candidate cap is rejected before arena allocation");
     }
 
     // --- Null buffers must be rejected, not dereferenced ----------------

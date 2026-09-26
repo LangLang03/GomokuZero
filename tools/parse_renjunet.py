@@ -1,181 +1,229 @@
 #!/usr/bin/env python3
-"""Parse RenjuNet XML game database into training samples.
+"""Convert audited RenjuNet records to grouped freestyle training examples.
 
-Output: <out>.npz with keys states[N,4,15,15], policies[N,225], winners[N].
+Default source rules are Gomoku Pro/Swap2/Swap (7,11,28), NOT Classic Renju
+(rule 1). These sources use different opening/overline rules, so metadata
+explicitly disables value supervision; their moves can be policy pretraining
+examples. The first five opening placements are never policy targets.
 
-Selection (matches the original pipeline):
-- rule=1 (Classic / freestyle, no forbidden moves)
-- swap in ('', '-')  (no swap games: black/white identity stays fixed)
-- at least 10 moves
+All games are validated before writing samples. Illegal repeats, unknown
+results, moves after freestyle termination and contradictory terminal results
+reject a whole record. Complete duplicate/D4-equivalent games are removed.
 
-Coordinate mapping: RenjuNet writes moves as "<col-letter><row-digit>"
-e.g. h8 -> col=7, row=7 -> move=7*15+7. State encoding mirrors
-Board.encode_state: channels [current stones, opponent stones, last move,
-all-ones if current player is black].
-
-Usage: python3 parse_renjunet.py <renjunet.xml> <out.npz> [--limit N]
+python tools/parse_renjunet.py data/renjunet.xml --bin-prefix data/gomoku_v2
+python tools/parse_renjunet.py data/renjunet.xml dataset.npz
 """
 import argparse
+from collections import Counter
+from dataclasses import dataclass
+import gzip
+import hashlib
+import html
+import json
+from pathlib import Path
 import re
+import struct
+import tempfile
+
 import numpy as np
 
-SIZE = 15
+from gomoku import BOARD, CELLS, Board
+
 XML_GAME_RE = re.compile(r'<game\b([^>]*)>(.*?)</game>', re.S)
 ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
-MOVE_RE = re.compile(r'([a-o])(\d{1,2})')
+MOVE_RE = re.compile(r'([a-o])([1-9]|1[0-5])')
+DEFAULT_RULES = {'7', '11', '28'}
 
 
-def parse_game(attrs_text, body, board, states_list, probs_list, winners_list):
-    attrs = dict(ATTR_RE.findall(attrs_text))
-    if attrs.get('rule', '') != '1':
-        return
-    swap = attrs.get('swap', '')
-    if swap not in ('', '-'):
-        return
-    m = re.search(r'<move>([^<]*)</move>', body)
-    if not m:
-        return
-    tokens = m.group(1).split()
-    if len(tokens) < 10:
-        return
+def canonical_moves(moves):
+    """Stable bytes for all eight square symmetries, preserving move order."""
+    points = np.asarray(moves, dtype=np.uint16)
+    rows, cols = points // BOARD, points % BOARD
+    variants = []
+    for _ in range(4):
+        variants.append((rows * BOARD + cols).astype('u1').tobytes())
+        variants.append((rows * BOARD + BOARD-1-cols).astype('u1').tobytes())
+        rows, cols = cols, BOARD-1-rows
+    return min(variants)
+
+
+@dataclass(frozen=True)
+class Game:
+    moves: tuple
+    winner: int
+    group: int
+    rule: str
+
+
+def validate_game(attrs, body, rules=DEFAULT_RULES, min_moves=10):
+    """Return (Game, None) or (None, rejection reason). No partial samples."""
+    if attrs.get('rule') not in rules:
+        return None, 'other_rule'
+    if attrs.get('swap', '') not in ('', '-'):
+        return None, 'swap_opening'
+    result = attrs.get('bresult')
+    if result not in ('1', '0', '0.5'):
+        return None, 'unknown_result'
+    match = re.search(r'<move>([^<]*)</move>', body)
+    if match is None:
+        return None, 'missing_moves'
+    tokens = match[1].split()
+    if len(tokens) < min_moves:
+        return None, 'short_game'
     moves = []
-    for tok in tokens:
-        mm = MOVE_RE.fullmatch(tok)
-        if not mm:
-            return
-        col = ord(mm.group(1)) - ord('a')
-        row = int(mm.group(2)) - 1
-        if not (0 <= col < SIZE and 0 <= row < SIZE):
-            return
-        moves.append(row * SIZE + col)
-    # remove duplicates (illegal repeats)
-    seen, clean = set(), []
-    for mv in moves:
-        if mv not in seen:
-            seen.add(mv)
-            clean.append(mv)
-    moves = clean
-    if len(moves) < 10:
-        return
+    for token in tokens:
+        move = MOVE_RE.fullmatch(token)
+        if move is None:
+            return None, 'invalid_coordinate'
+        moves.append((int(move[2])-1)*BOARD + ord(move[1])-ord('a'))
+    if len(set(moves)) != len(moves):
+        return None, 'repeated_move'
+    winner = {'1': 1, '0': 2, '0.5': -1}[result]
+    board = Board()
+    for index, move in enumerate(moves):
+        board.play(move)
+        ended, actual = board.game_end()
+        if ended:
+            if actual != winner:
+                return None, 'terminal_result_conflict'
+            if index != len(moves)-1:
+                return None, 'moves_after_terminal'
+    key = canonical_moves(moves)
+    group = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), 'little')
+    return Game(tuple(moves), winner, group, attrs['rule']), None
 
-    bresult = attrs.get('bresult', '')
-    winner = -1
-    if bresult == '1':
-        winner = 1
-    elif bresult == '0':
-        winner = 2
 
-    board.reset()
-    board.play(moves[0])  # black first
-    for k in range(len(moves) - 1):
-        # player to move for this state (before playing moves[k+1])
-        player_to_move = board.current_player
-        state = board.current_state()
-        states_list.append(state.reshape(-1))
-        p = np.zeros(SIZE * SIZE, dtype=np.float32)
-        p[moves[k + 1]] = 1.0
-        probs_list.append(p)
-        z = 1.0 if winner == player_to_move else (-1.0 if winner != -1 else 0.0)
-        winners_list.append(z)
-        board.play(moves[k + 1])
-        end, w = board.game_end()
-        if end:
+def read_games(path, rules=DEFAULT_RULES, min_moves=10, limit=None, skip_opening=5):
+    if min_moves < 1 or skip_opening < 0 or (limit is not None and limit < 1):
+        raise ValueError('min_moves/limit must be positive; skip_opening must be nonnegative')
+    opener = gzip.open if str(path).endswith('.gz') else open
+    with opener(path, 'rt', encoding='utf-8') as file:
+        content = file.read()
+    games, conflicts, counts = {}, set(), Counter()
+    for match in XML_GAME_RE.finditer(content):
+        counts['records'] += 1
+        attrs = {key: html.unescape(value) for key, value in ATTR_RE.findall(match[1])}
+        game, rejection = validate_game(attrs, match[2], rules, min_moves)
+        if rejection:
+            counts[rejection] += 1
+            continue
+        if len(game.moves) <= skip_opening:
+            counts['no_training_moves'] += 1
+            continue
+        key = canonical_moves(game.moves)
+        if key in conflicts:
+            counts['conflicting_duplicate'] += 1
+        elif key in games:
+            if games[key].winner == game.winner:
+                counts['duplicate_game'] += 1
+            else:
+                del games[key]
+                conflicts.add(key)
+                counts['conflicting_duplicate'] += 2
+        else:
+            games[key] = game
+    selected, samples = [], 0
+    for game in games.values():
+        selected.append(game)
+        samples += len(game.moves)-skip_opening
+        # Keep games intact. A sample limit may exceed its target by one game.
+        if limit is not None and samples >= limit:
             break
+    counts['accepted_games'], counts['samples'] = len(selected), samples
+    counts['excluded_by_limit'] = len(games)-len(selected)
+    return selected, dict(counts)
+
+
+def game_samples(game, skip_opening=5):
+    count = max(0, len(game.moves)-skip_opening)
+    states = np.empty((count, 4, BOARD, BOARD), dtype='<f4')
+    policies = np.zeros((count, CELLS), dtype='<f4')
+    winners = np.empty(count, dtype='<f4')
+    board = Board()
+    for index, move in enumerate(game.moves):
+        if index >= skip_opening:
+            row = index-skip_opening
+            states[row] = board.current_state()
+            policies[row, move] = 1
+            winners[row] = 0 if game.winner == -1 else (1 if game.winner == board.current_player else -1)
+        board.play(move)
+    groups = np.full(count, game.group, dtype='<u8')
+    return states, policies, winners, groups
+
+
+def write_dataset(games, counts, source, output=None, bin_prefix=None, skip_opening=5, rules=DEFAULT_RULES):
+    n = counts['samples']
+    if skip_opening < 0:
+        raise ValueError('skip_opening must be nonnegative')
+    if n != sum(max(0, len(game.moves)-skip_opening) for game in games):
+        raise ValueError('sample count disagrees with complete games and skip_opening')
+    if n == 0:
+        raise ValueError('no usable training samples')
+    metadata = {
+        'format_version': 2, 'samples': n, 'games': len(games),
+        'source': str(source), 'source_rules': sorted(rules),
+        'target_rules': 'freestyle', 'value_supervision': 'disabled',
+        'value_weight': 0.0, 'skip_opening': skip_opening,
+        'grouping': 'blake2b64 of D4 canonical complete move sequence',
+        'deduplicated': True, 'statistics': counts,
+    }
+    if bin_prefix is not None:
+        prefix = Path(bin_prefix)
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        specs = [('states', 4*CELLS), ('probs', CELLS), ('winners', 1), ('game_ids', 1)]
+        with tempfile.TemporaryDirectory(prefix='.dataset-', dir=prefix.parent) as temporary:
+            paths = [Path(temporary)/f'{name}.bin' for name, _ in specs]
+            files = [path.open('wb') for path in paths]
+            try:
+                for file, (_, width) in zip(files, specs):
+                    file.write(struct.pack('<Q', n*width))
+                for game in games:
+                    for file, values in zip(files, game_samples(game, skip_opening)):
+                        file.write(values.tobytes())
+            finally:
+                for file in files:
+                    file.close()
+            for path, (name, _) in zip(paths, specs):
+                path.replace(f'{prefix}_{name}.bin')
+        Path(f'{prefix}_meta.json').write_text(json.dumps(metadata, indent=2)+'\n')
+    if output is not None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.dataset-', dir=output.parent) as temporary:
+            specs = [('states', (n, 4, BOARD, BOARD), '<f4'),
+                     ('policies', (n, CELLS), '<f4'), ('winners', (n,), '<f4'),
+                     ('game_ids', (n,), '<u8')]
+            arrays = {key: np.lib.format.open_memmap(Path(temporary)/f'{key}.npy', mode='w+', dtype=dtype, shape=shape)
+                      for key, shape, dtype in specs}
+            offset = 0
+            for game in games:
+                rows = game_samples(game, skip_opening)
+                length = len(rows[0])
+                for key, values in zip(arrays, rows):
+                    arrays[key][offset:offset+length] = values
+                offset += length
+            for array in arrays.values():
+                array.flush()
+            np.savez(output, **arrays, metadata=np.asarray(json.dumps(metadata)))
+    return metadata
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('xml')
-    ap.add_argument('out')
-    ap.add_argument('--limit', type=int, default=None)
-    args = ap.parse_args()
-
-    class Board:
-        def __init__(self):
-            self.width = self.height = SIZE
-            self.n_in_row = 5
-            self.players = [1, 2]
-            self.reset()
-
-        def reset(self):
-            self.states = {}
-            self.current_player = 1
-            self.availables = list(range(SIZE * SIZE))
-            self.last_move = -1
-
-        def play(self, mv):
-            self.states[mv] = self.current_player
-            self.availables.remove(mv)
-            self.current_player = 2 if self.current_player == 1 else 1
-            self.last_move = mv
-
-        def game_end(self):
-            win, winner = self.has_a_winner()
-            if win:
-                return True, winner
-            if not self.availables:
-                return True, -1
-            return False, -1
-
-        def has_a_winner(self):
-            if self.last_move < 0:
-                return False, -1
-            r, c = divmod(self.last_move, SIZE)
-            p = self.states.get(self.last_move, -1)
-            if p == -1:
-                return False, -1
-            for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
-                cnt = 1
-                for s in range(1, 5):
-                    rr, cc = r + dr * s, c + dc * s
-                    if not (0 <= rr < SIZE and 0 <= cc < SIZE):
-                        break
-                    if self.states.get(rr * SIZE + cc) != p:
-                        break
-                    cnt += 1
-                for s in range(1, 5):
-                    rr, cc = r - dr * s, c - dc * s
-                    if not (0 <= rr < SIZE and 0 <= cc < SIZE):
-                        break
-                    if self.states.get(rr * SIZE + cc) != p:
-                        break
-                    cnt += 1
-                if cnt >= 5:
-                    return True, p
-            return False, -1
-
-        def current_state(self):
-            sq = np.zeros((4, SIZE, SIZE), dtype=np.float32)
-            if self.states:
-                for mv, pl in self.states.items():
-                    r, c = divmod(mv, SIZE)
-                    if pl == self.current_player:
-                        sq[0, r, c] = 1.0
-                    else:
-                        sq[1, r, c] = 1.0
-                if self.last_move >= 0:
-                    r, c = divmod(self.last_move, SIZE)
-                    sq[2, r, c] = 1.0
-            if len(self.states) % 2 == 0:
-                sq[3, :, :] = 1.0
-            return sq
-
-    board = Board()
-    states, probs, winners = [], [], []
-    with open(args.xml, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
-    for i, m in enumerate(XML_GAME_RE.finditer(content)):
-        parse_game(m.group(1), m.group(2), board, states, probs, winners)
-        if args.limit and len(winners) >= args.limit:
-            break
-        if (i + 1) % 20000 == 0:
-            print('games {}, samples {}'.format(i + 1, len(winners)))
-    print('total samples: {}'.format(len(winners)))
-    np.savez(args.out,
-             states=np.array(states, dtype=np.float32),
-             policies=np.array(probs, dtype=np.float32),
-             winners=np.array(winners, dtype=np.float32))
-    print('saved', args.out)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('xml', type=Path)
+    parser.add_argument('out', type=Path, nargs='?')
+    parser.add_argument('--bin-prefix', type=Path, help='stream raw C++ data files directly, with game IDs and metadata')
+    parser.add_argument('--limit', type=int, help='sample limit; final whole game may exceed it')
+    parser.add_argument('--rules', default=','.join(sorted(DEFAULT_RULES)), help='comma separated RenjuNet rule IDs; Classic Renju is 1')
+    parser.add_argument('--min-moves', type=int, default=10)
+    parser.add_argument('--skip-opening', type=int, default=5)
+    args = parser.parse_args()
+    if args.out is None and args.bin_prefix is None:
+        parser.error('provide output.npz or --bin-prefix')
+    rules = set(args.rules.split(','))
+    games, counts = read_games(args.xml, rules, args.min_moves, args.limit, args.skip_opening)
+    metadata = write_dataset(games, counts, args.xml, args.out, args.bin_prefix, args.skip_opening, rules)
+    print(json.dumps(metadata, indent=2))
 
 
 if __name__ == '__main__':

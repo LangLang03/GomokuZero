@@ -10,6 +10,7 @@ CudaNetworkBackend::CudaNetworkBackend(PureNet&, double)
     : impl_(std::make_unique<Impl>()) {}
 CudaNetworkBackend::~CudaNetworkBackend() = default;
 bool CudaNetworkBackend::available() const { return false; }
+void CudaNetworkBackend::synchronize() const {}
 bool CudaNetworkBackend::load(const std::string&) { return false; }
 bool CudaNetworkBackend::has_training_state(const std::string&) const {
     return false;
@@ -33,7 +34,7 @@ void CudaNetworkBackend::forward(const float*, int, float*, float*, bool) const 
 }
 PureNet::TrainStats CudaNetworkBackend::train_step(
     const std::vector<float>&, int, const std::vector<float>&,
-    const std::vector<float>&, double, double) {
+    const std::vector<float>&, double, double, const std::vector<float>&) {
     throw std::logic_error("CUDA backend is unavailable");
 }
 

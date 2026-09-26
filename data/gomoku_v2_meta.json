@@ -1,0 +1,29 @@
+{
+  "format_version": 2,
+  "samples": 129588,
+  "games": 4218,
+  "source": "data/renjunet.xml",
+  "source_rules": [
+    "11",
+    "28",
+    "7"
+  ],
+  "target_rules": "freestyle",
+  "value_supervision": "disabled",
+  "value_weight": 0.0,
+  "skip_opening": 5,
+  "grouping": "blake2b64 of D4 canonical complete move sequence",
+  "deduplicated": true,
+  "statistics": {
+    "records": 159000,
+    "other_rule": 138416,
+    "swap_opening": 6020,
+    "terminal_result_conflict": 18,
+    "moves_after_terminal": 6,
+    "short_game": 10317,
+    "duplicate_game": 5,
+    "accepted_games": 4218,
+    "samples": 129588,
+    "excluded_by_limit": 0
+  }
+}

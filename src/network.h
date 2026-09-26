@@ -5,7 +5,6 @@
 #include <vector>
 #include "gradient.h"
 #include "net_config.h"
-#include "optimizer.h"
 
 namespace gomoku {
 
@@ -46,7 +45,10 @@ public:
     bool load_training_state(const std::string& dir, int* batch_index_out);
     bool has_training_state(const std::string& dir) const;
 
-    struct TrainStats { float loss, entropy, policy_loss, value_loss; };
+    struct TrainStats {
+        float loss, entropy, policy_loss, value_loss;
+        float grad_norm = 0.0f;  // Before clipping.
+    };
 
     // states [B][4][15][15], probs [B][225], winners [B].
     // Requires the CUDA backend; throws std::logic_error otherwise.
@@ -54,7 +56,8 @@ public:
                           const std::vector<float>& probs,
                           const std::vector<float>& winners,
                           double lr,
-                          double value_loss_weight = 1.0);
+                          double value_loss_weight = 1.0,
+                          const std::vector<float>& value_weights = {});
 
     // [4][15][15] -> log_policy[225], value
     void forward_one(const std::vector<float>& state,
@@ -81,10 +84,18 @@ public:
     double weight_decay() const;
     void set_grad_clip(double max_norm);
     double grad_clip() const { return grad_clip_; }
+    // Optional BF16 training: master weights, loss and Adam moments stay FP32.
+    // Inference uses FP32 tensors with TF32 kernels by default; set
+    // GOMOK_INFERENCE_TF32=0 for strict FP32 arithmetic.
+    void set_mixed_precision(bool enabled) { mixed_precision_ = enabled; }
+    bool mixed_precision() const { return mixed_precision_; }
 
     bool using_cuda() const { return cuda_enabled_; }
     bool cuda_available() const;
     void set_cuda_enabled(bool enabled);
+    // Wait for queued training updates before wall-clock timing or shutdown.
+    // Inference and checkpoint reads already synchronize their outputs.
+    void synchronize() const;
 
     // Parameter count, for logging and tests.
     size_t parameter_count() const;
@@ -100,7 +111,6 @@ private:
     struct ConvBlock {
         ConvLayer conv;
         std::vector<float> bn_gamma, bn_beta, bn_mean, bn_var;
-        std::vector<float> bn_gamma_grad, bn_beta_grad;
         float bn_eps = 1e-5f;
 
         ConvBlock(int in_ch, int out_ch, int kh, int kw)
@@ -130,14 +140,14 @@ private:
     std::vector<FoldedConv> trunk_a_folded_, trunk_b_folded_;
     FoldedConv policy_folded_, value_folded_;
 
-    Adam adam_;
+    double weight_decay_ = 0.0;
     bool loaded_ = false;
-    // Remembered so switching to the native CPU path can re-read the same
-    // checkpoint instead of trying to mirror live CUDA tensors.
+    // Retained for diagnostics; backend switches mirror live tensors.
     std::string last_load_dir_;
     int resume_batch_index_ = 0;
     int inference_threads_ = 1;
     double grad_clip_ = 2.0;
+    bool mixed_precision_ = false;
     std::unique_ptr<CudaNetworkBackend> cuda_backend_;
     bool cuda_enabled_ = false;
 

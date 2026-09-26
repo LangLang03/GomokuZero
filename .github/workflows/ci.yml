@@ -1,33 +1,42 @@
 name: CI
-
 on:
   push:
     branches: [main, master]
   pull_request:
-
 jobs:
-  build:
-    name: Build & test (pure C++, no CUDA)
+  cpu:
+    name: CPU engine, data tools and sanitizers
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sanitizer: ["", "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy
+      - name: Build test engine
+        run: >-
+          cmake -S . -B build -DGOMOK_ENABLE_CUDA=OFF
+          -DGOMOK_NET_CHANNELS=8 -DGOMOK_NET_RES_BLOCKS=1
+          -DGOMOK_SANITIZER='${{ matrix.sanitizer }}'
+          -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+      - name: CLI end to end (CPU inference)
+        if: matrix.sanitizer == ''
+        run: |
+          ./build/gomoku_train export --cpu --output best_policy_ci_bin --seed 3
+          ./build/gomoku_train selfplay --model best_policy_ci_bin --games 3 --batch 2 --playout 4 --threads 2 --cpu
+          if ./build/gomoku_train train --cpu --games 1; then exit 1; fi
+      - run: python -m py_compile tools/*.py
+  production_compile:
+    name: Production network shape compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure
-        run: cmake -B build -DGOMOK_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        run: cmake --build build -j$(nproc)
-
-      - name: Unit tests (ctest)
-        run: ctest --test-dir build --output-on-failure
-
-      - name: End-to-end train smoke (1 batch, from scratch)
-        run: ./build/gomoku_train train --games 1 --playout 50 --batch-games 2 --check-freq 1 --threads 2 --cpu --tag ci
-        timeout-minutes: 5
-
-      - name: Self-play smoke against freshly trained model
-        run: ./build/gomoku_train selfplay --model best_policy_ci_bin --playout 100 --games 2 --batch 2 --threads 2 --cpu
-        timeout-minutes: 5
-
-      - name: Python tools compile check
-        run: python3 -m py_compile tools/*.py
+      - run: cmake -S . -B build -DGOMOK_ENABLE_CUDA=OFF -DBUILD_TESTING=OFF
+      - run: cmake --build build -j2

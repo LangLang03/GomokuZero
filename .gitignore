@@ -32,3 +32,11 @@ data/renjunet_classic.npz
 .vscode/
 .idea/
 .DS_Store
+
+# Generated datasets, run metrics and transactional checkpoint generations
+data/*.bin
+data/*.npz
+runs/
+best_policy_*_bin.staging/
+best_policy_*_bin.previous/
+analysis/

@@ -1,242 +1,135 @@
 cmake_minimum_required(VERSION 3.18)
 project(gomoku_cpp LANGUAGES CXX)
-
-# Sanitizer instrumentation. TSan cannot coexist with the CUDA runtime, so the
-# LibTorch backend is forced off below when thread sanitizing.
-set(GOMOK_SANITIZER "" CACHE STRING
-    "Sanitizers to enable: empty, address, thread, undefined, or a comma list")
-
-set(GOMOK_SANITIZER_FLAGS "")
-if(GOMOK_SANITIZER)
-    string(REPLACE "," ";" _san_list "${GOMOK_SANITIZER}")
-    foreach(_san IN LISTS _san_list)
-        if(_san STREQUAL "address")
-            list(APPEND GOMOK_SANITIZER_FLAGS -fsanitize=address)
-        elseif(_san STREQUAL "thread")
-            list(APPEND GOMOK_SANITIZER_FLAGS -fsanitize=thread)
-        elseif(_san STREQUAL "undefined")
-            list(APPEND GOMOK_SANITIZER_FLAGS -fsanitize=undefined)
-        else()
-            message(FATAL_ERROR "Unknown sanitizer: ${_san}")
-        endif()
-    endforeach()
-    list(APPEND GOMOK_SANITIZER_FLAGS -fno-omit-frame-pointer -g)
-    message(STATUS "Gomoku sanitizers: ${GOMOK_SANITIZER}")
-endif()
-
-option(GOMOK_ENABLE_CUDA "Enable the optional LibTorch/CUDA backend" ON)
-if(GOMOK_SANITIZER MATCHES "thread" AND GOMOK_ENABLE_CUDA)
-    message(STATUS
-        "Gomoku: TSan selected -> disabling the LibTorch/CUDA backend "
-        "(the CUDA runtime is incompatible with ThreadSanitizer)")
-    set(GOMOK_ENABLE_CUDA OFF)
-endif()
-if(GOMOK_ENABLE_CUDA)
-    execute_process(
-        COMMAND python3 -c "import pathlib, torch; print(pathlib.Path(torch.__file__).parent)"
-        OUTPUT_VARIABLE GOMOK_TORCH_ROOT
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET)
-    if(EXISTS "${GOMOK_TORCH_ROOT}/lib/libtorch_cuda.so")
-        set(Torch_FOUND TRUE)
-        set(TORCH_VERSION "Python wheel")
-        set(GOMOK_TORCH_INCLUDE "${GOMOK_TORCH_ROOT}/include")
-        set(GOMOK_TORCH_LIB "${GOMOK_TORCH_ROOT}/lib")
-        set(TORCH_LIBRARIES
-            "${GOMOK_TORCH_LIB}/libtorch.so"
-            "${GOMOK_TORCH_LIB}/libtorch_cuda.so"
-            "${GOMOK_TORCH_LIB}/libtorch_cpu.so"
-            "${GOMOK_TORCH_LIB}/libc10_cuda.so"
-            "${GOMOK_TORCH_LIB}/libc10.so")
-    endif()
-endif()
-
-include(CheckIPOSupported)
-option(GOMOK_ENABLE_IPO "Enable release link-time optimization" ON)
-if(GOMOK_SANITIZER AND GOMOK_ENABLE_IPO)
-    # LTO on instrumented translation units is unreliable.
-    set(GOMOK_ENABLE_IPO OFF)
-endif()
-if(GOMOK_ENABLE_IPO)
-    check_ipo_supported(RESULT GOMOK_IPO_SUPPORTED OUTPUT GOMOK_IPO_ERROR)
-else()
-    set(GOMOK_IPO_SUPPORTED FALSE)
-endif()
-
-# Applies the configured sanitizer flags to a target.
-# Applies the sanitizer-only network overrides to a target.
-function(gomok_apply_net_shape target)
-    if(GOMOK_SANITIZER_CHANNELS)
-        target_compile_definitions(${target} PRIVATE
-            GOMOK_NET_CHANNELS=${GOMOK_SANITIZER_CHANNELS})
-    endif()
-    if(GOMOK_SANITIZER_RES_BLOCKS)
-        target_compile_definitions(${target} PRIVATE
-            GOMOK_NET_RES_BLOCKS=${GOMOK_SANITIZER_RES_BLOCKS})
-    endif()
-endfunction()
-
-function(gomok_apply_sanitizer target)
-    if(NOT GOMOK_SANITIZER_FLAGS)
-        return()
-    endif()
-    target_compile_options(${target} PRIVATE ${GOMOK_SANITIZER_FLAGS})
-    target_link_options(${target} PRIVATE ${GOMOK_SANITIZER_FLAGS})
-endfunction()
-
-# Shrinks the trunk for sanitizer runs. TSan instruments every memory access,
-# so the production 12x192 trunk turns a self-play run into a very long wait;
-# the code under test (MCTS, queues, node arena) does not depend on the shape.
-set(GOMOK_SANITIZER_CHANNELS "" CACHE STRING
-    "Override NetConfig::kChannels (sanitizer builds only)")
-set(GOMOK_SANITIZER_RES_BLOCKS "" CACHE STRING
-    "Override NetConfig::kResBlocks (sanitizer builds only)")
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Use LibTorch from the Python wheel when CUDA is available.
-
-add_executable(gomoku_train
-    src/main.cpp
-    src/game.cpp
-    src/network.cpp
-    src/gradient.cpp
-    src/selfplay.cpp
-    src/train.cpp
-    src/logger.cpp
-)
-
-target_include_directories(gomoku_train PRIVATE src)
-target_link_libraries(gomoku_train PRIVATE pthread)
-if(Torch_FOUND)
-    # LTO on this LibTorch translation unit can exhaust memory.
-    set_source_files_properties(src/network_cuda.cpp PROPERTIES
-        COMPILE_OPTIONS "-O1;-fno-lto")
-    target_sources(gomoku_train PRIVATE src/network_cuda.cpp)
-    target_compile_definitions(gomoku_train PRIVATE GOMOK_HAS_TORCH=1
-                               _GLIBCXX_USE_CXX11_ABI=1)
-    target_include_directories(gomoku_train SYSTEM PRIVATE
-        "${GOMOK_TORCH_INCLUDE}"
-        "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
-    target_link_libraries(gomoku_train PRIVATE "${TORCH_LIBRARIES}")
-    set_property(TARGET gomoku_train PROPERTY BUILD_RPATH
-                 "${GOMOK_TORCH_LIB}")
-    message(STATUS "Gomoku CUDA backend: enabled (${TORCH_VERSION})")
-else()
-    target_sources(gomoku_train PRIVATE src/network_cuda_stub.cpp)
-    message(STATUS "Gomoku CUDA backend: unavailable; CPU fallback only")
+option(GOMOK_ENABLE_CUDA "Enable the optional LibTorch/CUDA backend" ON)
+option(GOMOK_ENABLE_IPO "Enable release link-time optimization" ON)
+set(GOMOK_SANITIZER "" CACHE STRING "Sanitizers: address, thread, undefined, or comma list")
+set(GOMOK_NET_CHANNELS "192" CACHE STRING "Residual trunk width")
+set(GOMOK_NET_RES_BLOCKS "12" CACHE STRING "Residual block count")
+# Compatibility with previous diagnostic build commands.
+set(GOMOK_SANITIZER_CHANNELS "" CACHE STRING "Deprecated: use GOMOK_NET_CHANNELS")
+set(GOMOK_SANITIZER_RES_BLOCKS "" CACHE STRING "Deprecated: use GOMOK_NET_RES_BLOCKS")
+if(GOMOK_SANITIZER_CHANNELS)
+    set(GOMOK_NET_CHANNELS "${GOMOK_SANITIZER_CHANNELS}")
 endif()
-if(GOMOK_IPO_SUPPORTED)
-    set_property(TARGET gomoku_train PROPERTY
-                 INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+if(GOMOK_SANITIZER_RES_BLOCKS)
+    set(GOMOK_NET_RES_BLOCKS "${GOMOK_SANITIZER_RES_BLOCKS}")
 endif()
-gomok_apply_net_shape(gomoku_train)
-gomok_apply_sanitizer(gomoku_train)
+foreach(shape GOMOK_NET_CHANNELS GOMOK_NET_RES_BLOCKS)
+    if(NOT "${${shape}}" MATCHES "^[1-9][0-9]*$")
+        message(FATAL_ERROR "${shape} must be a positive integer")
+    endif()
+endforeach()
+
+find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+set(GOMOK_SANITIZER_FLAGS "")
+if(GOMOK_SANITIZER)
+    set(GOMOK_ENABLE_IPO OFF)
+    string(REPLACE "," ";" sanitizers "${GOMOK_SANITIZER}")
+    foreach(san IN LISTS sanitizers)
+        if(NOT san MATCHES "^(address|thread|undefined)$")
+            message(FATAL_ERROR "Unknown sanitizer: ${san}")
+        endif()
+        list(APPEND GOMOK_SANITIZER_FLAGS "-fsanitize=${san}")
+    endforeach()
+    list(APPEND GOMOK_SANITIZER_FLAGS -fno-omit-frame-pointer -g)
+    if(GOMOK_SANITIZER MATCHES "thread")
+        set(GOMOK_ENABLE_CUDA OFF)
+    endif()
+endif()
+
+# Build each engine translation unit exactly once, including the expensive
+# LibTorch headers. Public flags keep all clients on the identical net shape/ABI.
+add_library(gomoku_core STATIC
+    src/game.cpp src/network.cpp src/gradient.cpp src/selfplay.cpp
+    src/dataset.cpp src/train.cpp src/logger.cpp)
+target_include_directories(gomoku_core PUBLIC src)
+target_link_libraries(gomoku_core PUBLIC Threads::Threads)
+if(NOT GOMOK_NET_CHANNELS STREQUAL "192" OR NOT GOMOK_NET_RES_BLOCKS STREQUAL "12")
+    target_compile_definitions(gomoku_core PUBLIC
+        GOMOK_NET_CHANNELS=${GOMOK_NET_CHANNELS}
+        GOMOK_NET_RES_BLOCKS=${GOMOK_NET_RES_BLOCKS})
+endif()
+target_compile_options(gomoku_core PUBLIC ${GOMOK_SANITIZER_FLAGS})
+target_link_options(gomoku_core PUBLIC ${GOMOK_SANITIZER_FLAGS})
+
+set(GOMOK_HAS_TORCH OFF)
+if(GOMOK_ENABLE_CUDA AND Python3_Interpreter_FOUND)
+    execute_process(COMMAND "${Python3_EXECUTABLE}" -c
+        "import pathlib, torch; print(pathlib.Path(torch.__file__).parent); print(int(torch.compiled_with_cxx11_abi()))"
+        OUTPUT_VARIABLE torch_info OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    string(REPLACE "\n" ";" torch_info "${torch_info}")
+    list(LENGTH torch_info torch_info_length)
+    if(torch_info_length EQUAL 2)
+        list(GET torch_info 0 torch_root)
+        list(GET torch_info 1 torch_abi)
+        if(EXISTS "${torch_root}/lib/libtorch_cuda.so")
+            set(GOMOK_HAS_TORCH ON)
+            target_sources(gomoku_core PRIVATE src/network_cuda.cpp)
+            # Avoid LTO and excessive compile memory for the LibTorch TU.
+            set_source_files_properties(src/network_cuda.cpp PROPERTIES COMPILE_OPTIONS "-O1;-fno-lto")
+            target_compile_definitions(gomoku_core PUBLIC GOMOK_HAS_TORCH=1 _GLIBCXX_USE_CXX11_ABI=${torch_abi})
+            target_include_directories(gomoku_core SYSTEM PRIVATE
+                "${torch_root}/include" "${torch_root}/include/torch/csrc/api/include")
+            foreach(lib torch torch_cuda torch_cpu c10_cuda c10)
+                target_link_libraries(gomoku_core PUBLIC "${torch_root}/lib/lib${lib}.so")
+            endforeach()
+            set(CMAKE_BUILD_RPATH "${torch_root}/lib")
+        endif()
+    endif()
+endif()
+if(NOT GOMOK_HAS_TORCH)
+    target_sources(gomoku_core PRIVATE src/network_cuda_stub.cpp)
+endif()
+message(STATUS "Gomoku CUDA backend: ${GOMOK_HAS_TORCH}; network: ${GOMOK_NET_RES_BLOCKS} x ${GOMOK_NET_CHANNELS}")
+
+include(CheckIPOSupported)
+if(GOMOK_ENABLE_IPO)
+    check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+    if(ipo_supported)
+        set_property(TARGET gomoku_core PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    endif()
+endif()
+add_executable(gomoku_train src/main.cpp)
+target_link_libraries(gomoku_train PRIVATE gomoku_core)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(gomoku_smoke
-        tests/smoke.cpp
-        src/game.cpp
-        src/network.cpp
-        src/gradient.cpp
-        src/selfplay.cpp
-    )
-    target_include_directories(gomoku_smoke PRIVATE src)
-    target_link_libraries(gomoku_smoke PRIVATE pthread)
-    if(Torch_FOUND)
-        target_sources(gomoku_smoke PRIVATE src/network_cuda.cpp)
-        target_compile_definitions(gomoku_smoke PRIVATE GOMOK_HAS_TORCH=1
-                                   _GLIBCXX_USE_CXX11_ABI=1)
-        target_include_directories(gomoku_smoke SYSTEM PRIVATE
-            "${GOMOK_TORCH_INCLUDE}"
-            "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
-        target_link_libraries(gomoku_smoke PRIVATE "${TORCH_LIBRARIES}")
-        set_property(TARGET gomoku_smoke PROPERTY BUILD_RPATH
-                     "${GOMOK_TORCH_LIB}")
-    else()
-        target_sources(gomoku_smoke PRIVATE src/network_cuda_stub.cpp)
+    function(gomoku_test name source)
+        add_executable(${name} ${source})
+        target_link_libraries(${name} PRIVATE gomoku_core)
+        add_test(NAME ${name} COMMAND ${name})
+        set_tests_properties(${name} PROPERTIES TIMEOUT 600)
+    endfunction()
+    gomoku_test(gomoku_smoke tests/smoke.cpp)
+    gomoku_test(gomoku_game_test tests/game_test.cpp)
+    gomoku_test(gomoku_gradient_test tests/gradient_check.cpp)
+    gomoku_test(gomoku_backend_parity tests/backend_parity.cpp)
+    gomoku_test(gomoku_regression tests/regression.cpp)
+    gomoku_test(gomoku_dataset_test tests/dataset_test.cpp)
+    gomoku_test(gomoku_search_test tests/search_test.cpp)
+    gomoku_test(gomoku_backend_training_test tests/backend_training.cpp)
+    gomoku_test(gomoku_trainer_test tests/trainer_test.cpp)
+    gomoku_test(gomoku_save_test tests/save_test.cpp)
+    set_tests_properties(gomoku_save_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gomoku_backend_benchmark tests/backend_benchmark.cpp)
+    target_link_libraries(gomoku_backend_benchmark PRIVATE gomoku_core)
+    add_executable(gomoku_subtree_benchmark tests/subtree_benchmark.cpp)
+    target_link_libraries(gomoku_subtree_benchmark PRIVATE gomoku_core)
+    add_executable(gomoku_value_evaluation tests/value_evaluation.cpp)
+    target_link_libraries(gomoku_value_evaluation PRIVATE gomoku_core)
+    add_executable(gomoku_diag_capacity tests/diag_capacity.cpp)
+    target_link_libraries(gomoku_diag_capacity PRIVATE gomoku_core)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME gomoku_python_tests COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s tests -p "test_*.py")
+        set_tests_properties(gomoku_python_tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 120
+            ENVIRONMENT "GOMOK_TRAIN_BINARY=$<TARGET_FILE:gomoku_train>")
     endif()
-    if(GOMOK_IPO_SUPPORTED)
-        set_property(TARGET gomoku_smoke PROPERTY
-                     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    endif()
-    gomok_apply_net_shape(gomoku_smoke)
-    gomok_apply_sanitizer(gomoku_smoke)
-    add_test(NAME gomoku_smoke COMMAND gomoku_smoke)
-
-    add_executable(gomoku_game_test
-        tests/game_test.cpp
-        src/game.cpp
-    )
-    target_include_directories(gomoku_game_test PRIVATE src)
-    gomok_apply_sanitizer(gomoku_game_test)
-    add_test(NAME gomoku_game_test COMMAND gomoku_game_test)
-
-    add_executable(gomoku_gradient_test
-        tests/gradient_check.cpp
-        src/gradient.cpp
-    )
-    target_include_directories(gomoku_gradient_test PRIVATE src)
-    gomok_apply_sanitizer(gomoku_gradient_test)
-    add_test(NAME gomoku_gradient_test COMMAND gomoku_gradient_test)
-
-    # CPU forward vs LibTorch forward on identical weights.
-    add_executable(gomoku_backend_parity
-        tests/backend_parity.cpp
-        src/game.cpp
-        src/network.cpp
-        src/gradient.cpp
-        src/logger.cpp
-    )
-    target_include_directories(gomoku_backend_parity PRIVATE src)
-    target_link_libraries(gomoku_backend_parity PRIVATE pthread)
-    if(Torch_FOUND)
-        target_sources(gomoku_backend_parity PRIVATE src/network_cuda.cpp)
-        target_compile_definitions(gomoku_backend_parity PRIVATE GOMOK_HAS_TORCH=1
-                                   _GLIBCXX_USE_CXX11_ABI=1)
-        target_include_directories(gomoku_backend_parity SYSTEM PRIVATE
-            "${GOMOK_TORCH_INCLUDE}"
-            "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
-        target_link_libraries(gomoku_backend_parity PRIVATE "${TORCH_LIBRARIES}")
-        set_property(TARGET gomoku_backend_parity PROPERTY BUILD_RPATH
-                     "${GOMOK_TORCH_LIB}")
-    else()
-        target_sources(gomoku_backend_parity PRIVATE src/network_cuda_stub.cpp)
-    endif()
-    gomok_apply_net_shape(gomoku_backend_parity)
-    gomok_apply_sanitizer(gomoku_backend_parity)
-    add_test(NAME gomoku_backend_parity COMMAND gomoku_backend_parity)
-
-    # Pins the correctness fixes reported against the source.
-    add_executable(gomoku_regression
-        tests/regression.cpp
-        src/game.cpp
-        src/network.cpp
-        src/gradient.cpp
-        src/selfplay.cpp
-        src/logger.cpp
-    )
-    target_include_directories(gomoku_regression PRIVATE src)
-    target_link_libraries(gomoku_regression PRIVATE pthread)
-    if(Torch_FOUND)
-        target_sources(gomoku_regression PRIVATE src/network_cuda.cpp)
-        target_compile_definitions(gomoku_regression PRIVATE GOMOK_HAS_TORCH=1
-                                   _GLIBCXX_USE_CXX11_ABI=1)
-        target_include_directories(gomoku_regression SYSTEM PRIVATE
-            "${GOMOK_TORCH_INCLUDE}"
-            "${GOMOK_TORCH_INCLUDE}/torch/csrc/api/include")
-        target_link_libraries(gomoku_regression PRIVATE "${TORCH_LIBRARIES}")
-        set_property(TARGET gomoku_regression PROPERTY BUILD_RPATH
-                     "${GOMOK_TORCH_LIB}")
-    else()
-        target_sources(gomoku_regression PRIVATE src/network_cuda_stub.cpp)
-    endif()
-    gomok_apply_net_shape(gomoku_regression)
-    gomok_apply_sanitizer(gomoku_regression)
-    add_test(NAME gomoku_regression COMMAND gomoku_regression)
 endif()

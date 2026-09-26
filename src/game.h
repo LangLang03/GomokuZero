@@ -19,6 +19,7 @@ public:
     inline int at(int idx) const { return cells_[idx]; }
 
     void reset();
+    // Rejects out-of-range, occupied and post-terminal moves without mutation.
     void play(int move);
     void undo();
 

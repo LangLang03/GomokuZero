@@ -17,12 +17,17 @@ struct NetConfig {
     // Shared trunk: a stem convolution followed by residual blocks. The
     // receptive field of a stack of 3x3 convolutions with padding 1 grows by
     // two per layer, so `kResBlocks` blocks (2 convolutions each) plus the
-    // stem see 2 * (2 * kResBlocks + 1) + 1 cells across. Detecting five in a
-    // row needs at least 9x9, and the previous 3-layer trunk only reached
-    // 7x7, so long-range threats were structurally invisible.
+    // stem see 2 * (2 * kResBlocks + 1) + 1 cells across. This describes one
+    // trunk feature; the dense heads also mix positions across the board.
+    // Receptive field alone does not measure tactical learning capacity.
     // Sanitizer builds may shrink the trunk. TSan instruments every memory
     // access, so the full 12x192 trunk makes a self-play run take tens of
     // minutes; the concurrency logic under test does not depend on the shape.
+#if defined(GOMOK_NET_CHANNELS) || defined(GOMOK_NET_RES_BLOCKS)
+    static constexpr bool kShapeOverridden = true;
+#else
+    static constexpr bool kShapeOverridden = false;
+#endif
 #ifndef GOMOK_NET_CHANNELS
 #define GOMOK_NET_CHANNELS 192
 #endif
@@ -35,11 +40,7 @@ struct NetConfig {
     // True when the trunk was shrunk for a sanitizer run, so tests can relax
     // capacity expectations without weakening the production assertions.
     static constexpr bool kShrunkForSanitizer() {
-#if defined(GOMOK_NET_CHANNELS) || defined(GOMOK_NET_RES_BLOCKS)
-        return true;
-#else
-        return false;
-#endif
+        return kShapeOverridden;
     }
 
     static constexpr int receptive_field() {

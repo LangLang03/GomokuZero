@@ -1,20 +1,30 @@
 #include "game.h"
 #include <cstring>
+#include <stdexcept>
 
 namespace gomoku {
 
 namespace {
 
-uint64_t mix64(uint64_t value) {
+constexpr uint64_t mix64(uint64_t value) {
     value += 0x9e3779b97f4a7c15ULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31);
 }
 
+constexpr auto make_stone_keys() {
+    std::array<std::array<uint64_t, 2>, BOARD_CELLS> keys{};
+    for (int move = 0; move < BOARD_CELLS; ++move)
+        for (int player = 0; player < 2; ++player)
+            keys[move][player] = mix64(static_cast<uint64_t>(move) * 2ULL + player);
+    return keys;
+}
+
+constexpr auto STONE_KEYS = make_stone_keys();
+
 uint64_t stone_key(int move, int player) {
-    return mix64(static_cast<uint64_t>(move) * 2ULL +
-                 static_cast<uint64_t>(player - 1));
+    return STONE_KEYS[move][player - 1];
 }
 
 }  // namespace
@@ -31,6 +41,10 @@ void Board::reset() {
 }
 
 void Board::play(int move) {
+    if (move < 0 || move >= BOARD_CELLS || cells_[move] != 0)
+        throw std::invalid_argument("move must name an empty board cell");
+    if (game_over())
+        throw std::logic_error("cannot play after the game has ended");
     position_hash_ ^= stone_key(move, current_);
     cells_[move] = static_cast<int8_t>(current_);
     history_[move_count_] = static_cast<int16_t>(move);
@@ -60,6 +74,7 @@ uint64_t Board::position_key() const {
 
 std::vector<int> Board::legal_moves() const {
     std::vector<int> moves;
+    if (game_over()) return moves;
     moves.reserve(BOARD_CELLS - move_count_);
     for (int i = 0; i < BOARD_CELLS; ++i)
         if (cells_[i] == 0) moves.push_back(i);

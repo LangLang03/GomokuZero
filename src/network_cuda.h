@@ -14,6 +14,7 @@ public:
     ~CudaNetworkBackend();
 
     bool available() const;
+    void synchronize() const;
     bool load(const std::string& directory);
     // The stored tensors have batch norm folded into the convolution, which
     // is exactly the form the native forward pass consumes.
@@ -42,7 +43,8 @@ public:
                                    const std::vector<float>& probs,
                                    const std::vector<float>& winners,
                                    double learning_rate,
-                                   double value_loss_weight = 1.0);
+                                   double value_loss_weight = 1.0,
+                                   const std::vector<float>& value_weights = {});
 
 private:
     struct Impl;

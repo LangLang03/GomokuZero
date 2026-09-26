@@ -1,6 +1,7 @@
 // Board rules and state encoding.
 #include "game.h"
 #include <cstdio>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -69,7 +70,7 @@ int main() {
             play(b, 0, r - 1);
             play(b, r, 7);
         }
-        play(b, 0, 4);
+        play(b, 0, 6); // Do not accidentally give black five first.
         play(b, 5, 7);
         CHECK(b.winner() == 2, "vertical win");
     }
@@ -145,6 +146,40 @@ int main() {
         int ones = 0;
         for (int i = 0; i < BOARD_CELLS; ++i) ones += s[3 * BOARD_CELLS + i] == 1.0f;
         CHECK(ones == 0, "white to move: marker plane zero");
+    }
+
+    {   // Invalid actions must not corrupt the board/hash/history.
+        Board b;
+        b.play(112);
+        const uint64_t key = b.position_key();
+        for (int move : {-1, BOARD_CELLS, 112}) {
+            bool rejected = false;
+            try { b.play(move); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            CHECK(rejected, "invalid action rejected");
+            CHECK(b.position_key() == key && b.move_count() == 1,
+                  "rejected action leaves board unchanged");
+        }
+        for (int i = 0; i < 4; ++i) {
+            b.play(i);
+            b.play(113 + i);
+        }
+        CHECK(b.winner() == 1, "black completes central five");
+        CHECK(b.legal_moves().empty(), "terminal board has no legal actions");
+        bool rejected = false;
+        try { b.play(10); }
+        catch (const std::logic_error&) { rejected = true; }
+        CHECK(rejected, "post-terminal action rejected");
+        b.undo();
+        CHECK(!b.game_over() && !b.legal_moves().empty(), "undo reopens terminal board");
+    }
+
+    {   // Cache keys include the last-move input plane, not only occupancy.
+        Board a, b;
+        for (int move : {112, 113, 97, 98}) a.play(move);
+        for (int move : {97, 98, 112, 113}) b.play(move);
+        CHECK(a.position_key() != b.position_key(),
+              "identical stones with different last moves need different keys");
     }
 
     if (fails == 0) {

@@ -4,8 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -24,6 +27,10 @@ bool write_bin_file(const std::string& path, const std::vector<float>& data) {
     f.write(reinterpret_cast<const char*>(&count), sizeof(count));
     f.write(reinterpret_cast<const char*>(data.data()),
             static_cast<std::streamsize>(count * sizeof(float)));
+    // Small tensors can stay in the stream buffer until destruction. Check
+    // flush/close explicitly so a failed final write cannot report success.
+    f.flush();
+    f.close();
     return static_cast<bool>(f);
 }
 
@@ -147,8 +154,9 @@ PureNet::PureNet(double lr)
       value_conv_(NetConfig::kChannels, 1, 1, 1),
       policy_fc_(NetConfig::kPolicyFcIn, NetConfig::kPolicyOut),
       value_fc1_(NetConfig::kValueFcIn, NetConfig::kValueHidden),
-      value_fc2_(NetConfig::kValueHidden, 1),
-      adam_(lr) {
+      value_fc2_(NetConfig::kValueHidden, 1) {
+    if (!std::isfinite(lr) || lr <= 0.0)
+        throw std::invalid_argument("learning rate must be finite and positive");
     init_params();
     cuda_backend_ = std::make_unique<CudaNetworkBackend>(*this, lr);
     cuda_enabled_ = cuda_backend_->available();
@@ -171,8 +179,17 @@ void PureNet::init_params() {
     for (int i = 0; i < NetConfig::kResBlocks; ++i)
         trunk_.push_back(std::make_unique<ResBlock>(NetConfig::kChannels));
 
-    std::mt19937 rng(static_cast<uint32_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
+    uint32_t seed = static_cast<uint32_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    if (const char* configured = std::getenv("GOMOK_SEED")) {
+        size_t consumed = 0;
+        const std::string text(configured);
+        const auto parsed = std::stoull(text, &consumed);
+        if (text.empty() || text.front() == '-' || consumed != text.size())
+            throw std::invalid_argument("GOMOK_SEED must be a nonnegative integer");
+        seed = static_cast<uint32_t>(parsed);
+    }
+    std::mt19937 rng(seed);
 
     // He-style initialisation for the rectified convolutions, scaled down for
     // the residual branches so the trunk starts near the identity.
@@ -187,8 +204,6 @@ void PureNet::init_params() {
         const float bound = gain * std::sqrt(6.0f / std::max(1.0f, fan_in));
         std::uniform_real_distribution<float> dist(-bound, bound);
         for (float& v : layer.w) v = dist(rng);
-        layer.gw.assign(weights, 0.0f);
-        layer.gb.assign(static_cast<size_t>(layer.out_ch), 0.0f);
     };
     auto init_fc = [&rng](FCLayer& layer) {
         const size_t weights =
@@ -198,31 +213,40 @@ void PureNet::init_params() {
         const float bound = std::sqrt(6.0f / static_cast<float>(layer.in_n));
         std::uniform_real_distribution<float> dist(-bound, bound);
         for (float& v : layer.w) v = dist(rng);
-        layer.gw.assign(weights, 0.0f);
-        layer.gb.assign(static_cast<size_t>(layer.out_n), 0.0f);
     };
 
     init_conv(stem_.conv, 1.0f);
     for (auto& block : trunk_) {
         init_conv(block->a.conv, 1.0f);
-        init_conv(block->b.conv, 0.1f);  // residual branch starts small
+        init_conv(block->b.conv, 1.0f);
     }
     init_conv(policy_conv_.conv, 1.0f);
     init_conv(value_conv_.conv, 1.0f);
     init_fc(policy_fc_);
     init_fc(value_fc1_);
     init_fc(value_fc2_);
+    // Before outcome supervision exists, MCTS must receive a neutral value
+    // prior. A random final head would drift with the policy-trained trunk
+    // despite having no evidence about which player will win. Consume the
+    // same random draws above, then zero only this last layer; all other
+    // parameters and their seeded initialization remain unchanged.
+    std::fill(value_fc2_.w.begin(), value_fc2_.w.end(), 0.0f);
+    std::fill(value_fc2_.b.begin(), value_fc2_.b.end(), 0.0f);
 
     auto init_bn = [](ConvBlock& block) {
         block.bn_gamma.assign(static_cast<size_t>(block.conv.out_ch), 1.0f);
         block.bn_beta.assign(static_cast<size_t>(block.conv.out_ch), 0.0f);
         block.bn_mean.assign(static_cast<size_t>(block.conv.out_ch), 0.0f);
         block.bn_var.assign(static_cast<size_t>(block.conv.out_ch), 1.0f);
-        block.bn_gamma_grad.assign(static_cast<size_t>(block.conv.out_ch), 0.0f);
-        block.bn_beta_grad.assign(static_cast<size_t>(block.conv.out_ch), 0.0f);
     };
     init_bn(stem_);
-    for (auto& block : trunk_) { init_bn(block->a); init_bn(block->b); }
+    for (auto& block : trunk_) {
+        init_bn(block->a);
+        init_bn(block->b);
+        // Scaling the convolution is cancelled by BN during training. Scale
+        // gamma so the residual branch really starts small in both modes.
+        std::fill(block->b.bn_gamma.begin(), block->b.bn_gamma.end(), 0.1f);
+    }
     init_bn(policy_conv_);
     init_bn(value_conv_);
 
@@ -330,13 +354,34 @@ void PureNet::forward_batch_impl(const float* states, int B, float* policy,
         cuda_backend_->forward(states, B, policy, value, probabilities);
         return;
     }
-    for (int b = 0; b < B; ++b) {
-        float v = 0.0f;
-        forward_impl(states + static_cast<size_t>(b) * 4 * CELLS,
-                     policy + static_cast<size_t>(b) * NetConfig::kPolicyOut,
-                     v, probabilities);
-        value[b] = v;
+    const int workers = std::min(B, inference_threads_);
+    auto run = [&](int worker) {
+        for (int b = worker; b < B; b += workers)
+            forward_impl(states + static_cast<size_t>(b) * NetConfig::kInputChannels * CELLS,
+                         policy + static_cast<size_t>(b) * NetConfig::kPolicyOut,
+                         value[b], probabilities);
+    };
+    if (workers == 1) {
+        run(0);
+        return;
     }
+    std::vector<std::exception_ptr> errors(static_cast<size_t>(workers));
+    auto checked_run = [&](int worker) {
+        try { run(worker); }
+        catch (...) { errors[worker] = std::current_exception(); }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<size_t>(workers - 1));
+    try {
+        for (int worker = 1; worker < workers; ++worker)
+            threads.emplace_back(checked_run, worker);
+    } catch (...) {
+        for (auto& thread : threads) thread.join();
+        throw;
+    }
+    checked_run(0);
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
 }
 
 // Forward API.
@@ -377,147 +422,109 @@ void PureNet::forward_batch_policy(const float* states, int B, float* policy,
 
 PureNet::TrainStats PureNet::train_step(
     const std::vector<float>& states, int B, const std::vector<float>& probs,
-    const std::vector<float>& winners, double lr, double value_loss_weight) {
+    const std::vector<float>& winners, double lr, double value_loss_weight,
+    const std::vector<float>& value_weights) {
     if (B <= 0 || states.size() != static_cast<size_t>(B) * 4 * CELLS ||
         probs.size() != static_cast<size_t>(B) * NetConfig::kPolicyOut ||
         winners.size() != static_cast<size_t>(B))
         throw std::invalid_argument("invalid training batch dimensions");
+    if (!value_weights.empty() && value_weights.size() != static_cast<size_t>(B))
+        throw std::invalid_argument("invalid value weight dimensions");
+    for (float w : value_weights)
+        if (!std::isfinite(w) || w < 0.0f)
+            throw std::invalid_argument("invalid value weight");
+    if (!std::isfinite(lr) || lr <= 0.0 || !std::isfinite(value_loss_weight) ||
+        value_loss_weight < 0.0)
+        throw std::invalid_argument("invalid learning rate or value loss weight");
+    for (float x : states)
+        if (!std::isfinite(x)) throw std::invalid_argument("non-finite state");
+    for (int b = 0; b < B; ++b) {
+        if (!std::isfinite(winners[b]) || std::abs(winners[b]) > 1.0f)
+            throw std::invalid_argument("value target must be in [-1, 1]");
+        double sum = 0.0;
+        for (int i = 0; i < NetConfig::kPolicyOut; ++i) {
+            const float p = probs[static_cast<size_t>(b) * NetConfig::kPolicyOut + i];
+            if (!std::isfinite(p) || p < 0.0f)
+                throw std::invalid_argument("invalid policy target");
+            sum += p;
+        }
+        if (std::abs(sum - 1.0) > 1e-3)
+            throw std::invalid_argument("policy target must sum to one");
+    }
     if (!cuda_enabled_)
         throw std::logic_error(
             "training requires the LibTorch backend; rebuild with "
             "-DGOMOK_ENABLE_CUDA=ON or run with --cpu removed");
     return cuda_backend_->train_step(states, B, probs, winners, lr,
-                                     value_loss_weight);
+                                     value_loss_weight, value_weights);
 }
 
 bool PureNet::load_native(const std::string& dir) {
-    // Two on-disk forms are accepted.
-    //
-    //   Inference export (no training.meta): batch normalisation is already
-    //   folded into the convolution, which is directly what the native forward
-    //   pass consumes.
-    //
-    //   Training checkpoint (training.meta present): the convolution keeps its
-    //   own weights and the batch norm keeps gamma/beta/running statistics
-    //   separately, because folding destroys the parameterisation. The folded
-    //   buffers are then rebuilt from those raw tensors.
     const bool training_format = has_training_state(dir);
-
-    auto conv_slots = [&](size_t index) -> std::pair<ConvBlock*, FoldedConv*> {
-        if (index == 0) return {&stem_, &stem_folded_};
-        const size_t block = (index - 1) / 2;
-        const bool second = ((index - 1) % 2) == 1;
-        if (block >= trunk_.size()) return {nullptr, nullptr};
-        return second ? std::make_pair(&trunk_[block]->b, &trunk_b_folded_[block])
-                      : std::make_pair(&trunk_[block]->a, &trunk_a_folded_[block]);
-    };
-
     if (training_format) {
-        auto read_conv_raw = [&](size_t index, const std::string& prefix) {
-            auto [block, folded] = conv_slots(index);
-            if (block == nullptr) return false;
-            ConvLayer& conv = block->conv;
-            const size_t weights = static_cast<size_t>(conv.out_ch) * conv.in_ch *
-                                   conv.kh * conv.kw;
-            const size_t channels = static_cast<size_t>(conv.out_ch);
-            return read_bin_file(dir + "/" + prefix + "weight.bin", conv.w,
-                                 weights) &&
-                   read_bin_file(dir + "/" + prefix + "bias.bin", conv.b,
-                                 channels) &&
-                   read_bin_file(dir + "/" + prefix + "bn_gamma.bin",
-                                 block->bn_gamma, channels) &&
-                   read_bin_file(dir + "/" + prefix + "bn_beta.bin",
-                                 block->bn_beta, channels) &&
-                   read_bin_file(dir + "/" + prefix + "bn_mean.bin",
-                                 block->bn_mean, channels) &&
-                   read_bin_file(dir + "/" + prefix + "bn_var.bin",
-                                 block->bn_var, channels) &&
-                   (conv.gw.assign(weights, 0.0f), true) &&
-                   (conv.gb.assign(channels, 0.0f), true) &&
-                   (folded != nullptr);
+        std::ifstream meta(dir + "/training.meta");
+        auto field = [&](const char* expected, auto& value) {
+            std::string key;
+            return static_cast<bool>(meta >> key >> value) && key == expected;
         };
-        size_t index = 0;
-        if (!read_conv_raw(index++, "training_conv0_")) return false;
-        for (size_t i = 0; i < trunk_.size(); ++i) {
-            if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
-                return false;
-            if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
-                return false;
-        }
-        if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
-            return false;
-        if (!read_conv_raw(index++, "training_conv" + std::to_string(index - 1) + "_"))
-            return false;
-
-        auto read_fc_raw = [&](size_t fc_index, FCLayer& layer) {
-            const std::string prefix =
-                "training_fc" + std::to_string(fc_index) + "_";
-            return read_bin_file(dir + "/" + prefix + "weight.bin", layer.w,
-                                 static_cast<size_t>(layer.out_n) * layer.in_n) &&
-                   read_bin_file(dir + "/" + prefix + "bias.bin", layer.b,
-                                 static_cast<size_t>(layer.out_n));
-        };
-        if (!read_fc_raw(0, policy_fc_)) return false;
-        if (!read_fc_raw(1, value_fc1_)) return false;
-        if (!read_fc_raw(2, value_fc2_)) return false;
-
-        // Rebuild the folded buffers from the raw tensors, which is also what
-        // keeps the native forward pass correct for a later --cpu switch.
-        rebuild_folded_weights();
-        loaded_ = true;
-        return true;
+        int version = 0, batches = 0, conv_count = 0, fc_count = 0;
+        int64_t step = 0;
+        if (!field("version", version) || (version != 1 && version != 2) ||
+            !field("batch_index", batches) || batches < 0 ||
+            !field("optimizer_step", step) || step < 0 ||
+            !field("conv_count", conv_count) || conv_count != 3 + 2 * NetConfig::kResBlocks ||
+            !field("fc_count", fc_count) || fc_count != 3) return false;
     }
-
-    auto read_folded = [&](const std::string& name, FoldedConv& folded,
-                           ConvLayer& conv) {
-        const size_t weights = static_cast<size_t>(conv.out_ch) * conv.in_ch *
-                               conv.kh * conv.kw;
-        const size_t biases = static_cast<size_t>(conv.out_ch);
-        if (!read_bin_file(dir + "/" + name + "_weight.bin", folded.w, weights))
-            return false;
-        if (!read_bin_file(dir + "/" + name + "_bias.bin", folded.b, biases))
-            return false;
-        // Keep the structured copy in step so a later save() round-trips.
-        conv.w = folded.w;
-        conv.b = folded.b;
-        conv.gw.assign(weights, 0.0f);
-        conv.gb.assign(biases, 0.0f);
+    std::vector<std::pair<std::vector<float>*, std::vector<float>>> pending;
+    auto prepare = [&](const std::string& file, std::vector<float>& target,
+                       size_t size, bool variance = false) {
+        std::vector<float> data;
+        if (!read_bin_file(dir + "/" + file, data, size)) return false;
+        for (float x : data)
+            if (!std::isfinite(x) || (variance && x < 0.0f)) return false;
+        pending.emplace_back(&target, std::move(data));
         return true;
     };
-    auto identity_bn = [](ConvBlock& block) {
-        const size_t channels = static_cast<size_t>(block.conv.out_ch);
-        block.bn_gamma.assign(channels, 1.0f);
-        block.bn_beta.assign(channels, 0.0f);
-        block.bn_mean.assign(channels, 0.0f);
-        block.bn_var.assign(channels, 1.0f - block.bn_eps);
-    };
-    auto read_fc = [&](const std::string& name, FCLayer& layer) {
-        return read_bin_file(dir + "/" + name + "_weight.bin", layer.w,
-                             static_cast<size_t>(layer.out_n) * layer.in_n) &&
-               read_bin_file(dir + "/" + name + "_bias.bin", layer.b,
-                             static_cast<size_t>(layer.out_n));
-    };
-
-    if (!read_folded("stem", stem_folded_, stem_.conv)) return false;
-    identity_bn(stem_);
+    std::vector<std::pair<std::string, ConvBlock*>> convs{{"stem", &stem_}};
     for (size_t i = 0; i < trunk_.size(); ++i) {
-        const std::string base = "res" + std::to_string(i);
-        if (!read_folded(base + "_a", trunk_a_folded_[i], trunk_[i]->a.conv))
-            return false;
-        if (!read_folded(base + "_b", trunk_b_folded_[i], trunk_[i]->b.conv))
-            return false;
-        identity_bn(trunk_[i]->a);
-        identity_bn(trunk_[i]->b);
+        convs.emplace_back("res" + std::to_string(i) + "_a", &trunk_[i]->a);
+        convs.emplace_back("res" + std::to_string(i) + "_b", &trunk_[i]->b);
     }
-    if (!read_folded("policy_conv1", policy_folded_, policy_conv_.conv))
-        return false;
-    if (!read_folded("val_conv1", value_folded_, value_conv_.conv)) return false;
-    identity_bn(policy_conv_);
-    identity_bn(value_conv_);
-    if (!read_fc("act_fc1", policy_fc_)) return false;
-    if (!read_fc("val_fc1", value_fc1_)) return false;
-    if (!read_fc("val_fc2", value_fc2_)) return false;
-
+    convs.emplace_back("policy_conv1", &policy_conv_);
+    convs.emplace_back("val_conv1", &value_conv_);
+    for (size_t i = 0; i < convs.size(); ++i) {
+        auto& block = *convs[i].second;
+        auto& conv = block.conv;
+        const auto prefix = training_format ? "training_conv" + std::to_string(i) : convs[i].first;
+        const size_t channels = static_cast<size_t>(conv.out_ch);
+        if (!prepare(prefix + "_weight.bin", conv.w, channels * conv.in_ch * conv.kh * conv.kw) ||
+            !prepare(prefix + "_bias.bin", conv.b, channels)) return false;
+        if (training_format &&
+            (!prepare(prefix + "_bn_gamma.bin", block.bn_gamma, channels) ||
+             !prepare(prefix + "_bn_beta.bin", block.bn_beta, channels) ||
+             !prepare(prefix + "_bn_mean.bin", block.bn_mean, channels) ||
+             !prepare(prefix + "_bn_var.bin", block.bn_var, channels, true))) return false;
+    }
+    const std::vector<std::pair<std::string, FCLayer*>> fcs{
+        {"act_fc1", &policy_fc_}, {"val_fc1", &value_fc1_}, {"val_fc2", &value_fc2_}};
+    for (size_t i = 0; i < fcs.size(); ++i) {
+        auto& fc = *fcs[i].second;
+        const auto prefix = training_format ? "training_fc" + std::to_string(i) : fcs[i].first;
+        if (!prepare(prefix + "_weight.bin", fc.w, static_cast<size_t>(fc.in_n) * fc.out_n) ||
+            !prepare(prefix + "_bias.bin", fc.b, fc.out_n)) return false;
+    }
+    for (auto& item : pending) *item.first = std::move(item.second);
+    if (!training_format) {
+        for (auto& entry : convs) {
+            auto& block = *entry.second;
+            const size_t channels = static_cast<size_t>(block.conv.out_ch);
+            block.bn_gamma.assign(channels, 1.0f);
+            block.bn_beta.assign(channels, 0.0f);
+            block.bn_mean.assign(channels, 0.0f);
+            block.bn_var.assign(channels, 1.0f - block.bn_eps);
+        }
+    }
+    rebuild_folded_weights();
     loaded_ = true;
     return true;
 }
@@ -534,12 +541,16 @@ bool PureNet::load(const std::string& dir) {
         return true;
     }
 
-    // Native buffers are always populated first so a later --cpu switch has
-    // valid weights; the LibTorch module then becomes the authority.
-    if (!load_native(dir)) return false;
+    // Validate and commit through one authority. Reading the directory twice
+    // could leave a new native model paired with old CUDA weights when the
+    // second read failed (e.g. a concurrently replaced checkpoint).
+    if (cuda_available()) {
+        if (!cuda_backend_->load(dir)) return false;
+        cuda_backend_->sync_to_cpu();
+    } else if (!load_native(dir)) return false;
     last_load_dir_ = dir;
     loaded_ = true;
-    if (cuda_enabled_ && !cuda_backend_->load(dir)) return false;
+    resume_batch_index_ = 0;
     std::fprintf(stderr, "[net] loaded %zu parameters from %s%s\n",
                  parameter_count(), dir.c_str(),
                  cuda_enabled_ ? " (CUDA)" : "");
@@ -552,6 +563,12 @@ bool PureNet::has_training_state(const std::string& dir) const {
 }
 
 bool PureNet::export_inference(const std::string& dir) const {
+    // An existing training.meta would make load() prefer stale raw weights
+    // over this export. Refuse mixing both artifact types through this API.
+    if (has_training_state(dir)) return false;
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    if (error) return false;
     if (cuda_enabled_) return cuda_backend_->save(dir);
     // Native side: the folded buffers are already the inference form.
     auto write_folded = [&](const std::string& name, const FoldedConv& folded) {
@@ -578,26 +595,34 @@ bool PureNet::export_inference(const std::string& dir) const {
 
 bool PureNet::save_training_state(const std::string& dir,
                                   int batch_index) const {
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    if (error || batch_index < 0) return false;
     // Only the LibTorch backend trains, and its optimiser holds the moments, so
     // it owns the checkpoint. The native side has no training state to lose.
-    if (cuda_enabled_)
+    // A temporary switch to native inference must not discard the live Adam
+    // moments. The CUDA module remains the training authority while disabled.
+    if (cuda_available())
         return cuda_backend_->save_training_state(dir, batch_index, 0, {}, {});
-    return export_inference(dir);
+    return false;
 }
 
 bool PureNet::load_training_state(const std::string& dir,
                                   int* batch_index_out) {
     int batches = 0;
-    if (cuda_enabled_) {
+    if (cuda_available()) {
         if (!cuda_backend_->load_training_state(dir, &batches, nullptr, nullptr,
                                                 nullptr))
             return false;
-    } else if (!load_native(dir)) {
-        return false;
+        cuda_backend_->sync_to_cpu();
+    } else {
+        if (!load_native(dir)) return false;
+        std::ifstream meta(dir + "/training.meta");
+        std::string key;
+        int version = 0;
+        if (!(meta >> key >> version) || key != "version" ||
+            !(meta >> key >> batches) || key != "batch_index") return false;
     }
-    // The checkpoint also carries the folded inference export, so the native
-    // buffers stay valid for a --cpu switch.
-    load_native(dir);
     resume_batch_index_ = batches;
     if (batch_index_out != nullptr) *batch_index_out = batches;
     return true;
@@ -631,14 +656,22 @@ bool PureNet::cuda_available() const {
     return cuda_backend_ && cuda_backend_->available();
 }
 
+void PureNet::synchronize() const {
+    if (cuda_available()) cuda_backend_->synchronize();
+}
+
 void PureNet::set_weight_decay(double weight_decay) {
-    adam_.set_weight_decay(weight_decay);
+    if (!std::isfinite(weight_decay) || weight_decay < 0.0)
+        throw std::invalid_argument("weight decay must be finite and nonnegative");
+    weight_decay_ = weight_decay;
     if (cuda_backend_) cuda_backend_->set_weight_decay(weight_decay);
 }
 
-double PureNet::weight_decay() const { return adam_.weight_decay(); }
+double PureNet::weight_decay() const { return weight_decay_; }
 
 void PureNet::set_grad_clip(double max_norm) {
+    if (!std::isfinite(max_norm))
+        throw std::invalid_argument("gradient clip must be finite");
     grad_clip_ = max_norm > 0.0 ? max_norm : 0.0;
 }
 
@@ -646,12 +679,11 @@ void PureNet::set_cuda_enabled(bool enabled) {
     const bool requested = enabled && cuda_available();
     if (requested == cuda_enabled_) return;
     if (!requested && cuda_enabled_) {
+        cuda_backend_->sync_to_cpu();
         cuda_enabled_ = false;
-        // Live CUDA tensors cannot be mirrored exactly into the folded native
-        // layout, so re-read the checkpoint that produced them.
-        if (!last_load_dir_.empty()) load_native(last_load_dir_);
     } else if (requested) {
-        cuda_backend_->sync_from_cpu();
+        // CPU inference does not modify weights; the CUDA optimiser remains
+        // authoritative and can resume without resetting its moments.
         cuda_enabled_ = true;
     }
 }

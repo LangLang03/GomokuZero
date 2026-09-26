@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <vector>
 #include "game.h"
 #include "network.h"
@@ -15,7 +16,8 @@ struct SearchConfig {
     int batch_games = 64;
     int n_threads = -1;  // <0: derive from hardware
 
-    // Temperature schedule: full exploration for the opening, then sharper.
+    // Move-sampling temperature: explore the opening, then play more sharply.
+    // Policy training targets always use normalized raw visit counts.
     float temp_high = 1.0f;
     float temp_low = 0.5f;
     int temp_switch_move = 30;
@@ -25,34 +27,37 @@ struct SearchConfig {
     float dirichlet_eps = 0.25f;
     float dirichlet_alpha = 0.3f;
 
-    // Node expansion cap. Positions outside this window would otherwise be
-    // trained as "never play here"; see unseen_move_smooth.
+    // Expansion cap. Root noise is drawn across all legal moves before
+    // pruning. A promoted root also retains previously visited children, so
+    // its child count may reach twice this limit.
     int max_candidates = 60;
 
-    // Target size of one batched inference call on CUDA. Measured on the
-    // 12-block trunk: 32 gives the best throughput (2846 eval/s) on an
-    // RTX 5060, while 128 -- inherited from the old 3-layer network -- is
-    // about 10% slower. 0 derives the default.
+    // Deterministic opening pairs in the arena; colours swap on the identical
+    // position. Zero retains empty-board evaluation.
+    int eval_opening_moves = 4;
+
+    // Target size of one CUDA inference call; the scheduler derives the
+    // maximum in-flight leaves per game from this and batch_games.
+    // Zero uses 32. Tune against the selected network and GPU.
     int inference_batch_target = 0;
 
-    // Virtual loss applied to a node while a playout is in flight. Larger
-    // values spread concurrent threads over distinct branches instead of
-    // having them collide on the same child and retry.
-    //
-    // Measured with 8 MCTS threads at 100 playouts: the retry-to-evaluation
-    // ratio is 637 at 1.0, 720 at 3.0, 523 at 8.0 and 723 at 20.0, so 8
-    // minimises collisions without starving the best branch.
+    // Virtual loss discourages concurrent selections of an in-flight branch.
+    // Bounded in-flight work keeps it from dominating completed search values.
     float virtual_loss = 8.0f;
 
-    // Probability mass reserved for legal moves that MCTS never visited, so
-    // the policy target does not assert p = 0 for unexplored legal moves.
-    float unseen_move_smooth = 0.05f;
+    // Optional uniform smoothing over legal moves. Zero keeps the standard
+    // search target. Forced tactical actions always retain their exact target.
+    float unseen_move_smooth = 0.0f;
 
     // Returns the sampling temperature for a given ply.
     float temperature_at(int move_number) const {
         return move_number < temp_switch_move ? temp_high : temp_low;
     }
 };
+
+// Shared by CLI/trainer and every search entry point; throws on invalid or
+// unrepresentable search budgets before allocating trees or starting training.
+void validate_search_config(const SearchConfig& config);
 
 // Outcome of an arena match between two models.
 struct MatchResult {
@@ -66,6 +71,12 @@ struct MatchResult {
     // the two models compare, so the score alone is not a strength signal.
     int black_wins = 0;
     int white_wins = 0;
+    // One pair uses an identical opening with model colours swapped. Compare
+    // its combined candidate score with 1: greater wins, less loses, equal ties.
+    // Only complete pairs count when the API receives an odd game count.
+    int pair_wins = 0;
+    int pair_losses = 0;
+    int pair_draws = 0;
 
     double score() const {
         // Wins count 1, draws 0.5, matching the usual Elo convention.
@@ -84,11 +95,36 @@ struct MatchResult {
 int search_best_move(PureNet& net, const Board& board,
                      const SearchConfig& config);
 
-// Plays `games` games of `candidate` versus `opponent`, alternating colours.
-// This is the only measurement that reflects playing strength; validation
-// loss on human records measures agreement with human one-hot labels.
+// Backend-independent single-position search. The evaluator returns policy
+// probabilities and a value in [-1, 1] from the leaf's side-to-move perspective.
+using PositionEvaluator = std::function<void(
+    const Board&, std::array<float, BOARD_CELLS>&, float&)>;
+int search_best_move(const Board& board, const SearchConfig& config,
+                     const PositionEvaluator& evaluate);
+
+// Inspect the same root visit target used by self-play without a neural backend.
+struct SearchResult {
+    int move = -1;
+    std::array<float, BOARD_CELLS> policy{};
+    int completed_playouts = 0;
+    int evaluations = 0;
+};
+SearchResult search_position(const Board& board, const SearchConfig& config,
+                             const PositionEvaluator& evaluate);
+
+// Policy/value output uses [batch][BOARD_CELLS] and [batch] layouts. Input
+// states use [batch][4][BOARD_SIZE][BOARD_SIZE], matching Board::encode_state.
+using BatchPositionEvaluator = std::function<void(const float*, int, float*, float*)>;
+
+// Plays `games` games of `candidate` versus `opponent` on reproducible paired
+// openings with swapped colours. Even game counts keep the colour split fair.
+// Human-record validation loss alone does not establish playing strength.
 MatchResult play_match(PureNet& candidate, PureNet& opponent,
                        const SearchConfig& config, int games);
+MatchResult play_match(const BatchPositionEvaluator& candidate,
+                       const BatchPositionEvaluator& opponent,
+                       const SearchConfig& config, int games);
+
 
 // Batched lock-free MCTS with one inference coordinator.
 class BatchedSelfPlay {
@@ -100,6 +136,10 @@ public:
     };
 
     BatchedSelfPlay(PureNet& net, const SearchConfig& config);
+    // Backend-independent path for deterministic concurrency tests and other
+    // inference engines. accelerated selects the GPU-sized batch schedule.
+    BatchedSelfPlay(const SearchConfig& config, BatchPositionEvaluator evaluate,
+                    bool accelerated = false);
     // Backwards-compatible shorthand: no root noise, flat temperature.
     BatchedSelfPlay(PureNet& net, float c_puct, int n_playout,
                     int batch_games, int n_threads = -1);
@@ -110,9 +150,14 @@ public:
     std::vector<std::vector<Sample>> run_batch(float temp = -1.0f);
 
     const SearchConfig& config() const { return config_; }
+    // Restore the number of generated batches when resuming a seeded run.
+    void set_batch_counter(uint64_t completed_batches) {
+        batch_counter_ = completed_batches;
+    }
 
 private:
-    PureNet& net_;
+    BatchPositionEvaluator evaluate_;
+    bool accelerated_;
     SearchConfig config_;
     float c_puct_;
     int n_playout_;
