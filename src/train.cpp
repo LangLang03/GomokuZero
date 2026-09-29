@@ -47,10 +47,15 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::invalid_argument(message);
 }
 bool nonnegative(double x) { return std::isfinite(x) && x >= 0; }
+// Self-play holdout size. Large enough to measure the value head, small enough
+// that withholding these batches from the replay buffer stays irrelevant.
+constexpr size_t kSelfplayProbeCap = 20000;
 // Persist the numerical training contract. Extending the requested number of
-// batches/epochs is allowed; silently changing the saved experiment is not.
+// batches/epochs is allowed; changing the saved experiment requires an explicit
+// opt-in for a dataset transition.
 std::string training_contract(const TrainConfig& c, const SearchConfig& s,
-                              bool selfplay_started, bool include_tree_reuse = true) {
+                              bool selfplay_started, bool include_tree_reuse = true,
+                              bool include_mix_data = true) {
     std::ostringstream out;
     out << std::setprecision(17) << c.batch_size
         << ' ' << c.lr_base << ' ' << c.lr_final_fraction
@@ -75,7 +80,7 @@ std::string training_contract(const TrainConfig& c, const SearchConfig& s,
         out << " GOMOK_TREE_REUSE="
             << ((value == nullptr || std::strcmp(value, "0") != 0) ? 1 : 0);
     }
-    if (!c.mix_data.empty()) {
+    if (include_mix_data && !c.mix_data.empty()) {
         out << ' ' << std::quoted(std::filesystem::weakly_canonical(c.mix_data).string());
         for (const char* suffix : {"_states.bin", "_probs.bin", "_winners.bin", "_game_ids.bin", "_meta.json"}) {
             const auto path = c.mix_data + suffix;
@@ -107,6 +112,7 @@ void validate_train_config(const TrainConfig& c, const SearchConfig& s) {
     require(c.game_batch_num > 0 || c.pretrain_epochs > 0, "request at least one training phase");
     require(c.check_freq > 0 && c.validation_freq >= 0 && c.kl_freq >= 0, "invalid diagnostic/checkpoint frequency");
     require(c.validation_samples >= 0 && c.early_stop_patience >= 0, "invalid validation samples or patience");
+    require(nonnegative(c.select_value_weight) && c.selfplay_val_every >= 0, "invalid selection/validation configuration");
     require(c.lr_base > 0 && std::isfinite(c.lr_base), "lr must be finite and positive");
     require(c.lr_final_fraction > 0 && c.lr_final_fraction <= 1, "lr-final-fraction must be in (0,1]");
     require(c.lr_warmup_batches >= 0 && c.pretrain_warmup_steps >= 0, "warmup must be nonnegative");
@@ -199,9 +205,26 @@ void Trainer::restore_trainer_state() {
     if (!meta) throw std::runtime_error("cannot read trainer configuration");
     const bool legacy_contract =
         saved_contract == training_contract(config_, search_, saved_batch > 0, false);
+    bool dataset_transition = false;
     if (saved_contract != training_contract(config_, search_, saved_batch > 0) &&
-        !legacy_contract)
-        throw std::runtime_error("resume training configuration or dataset changed; pass the original training/search options and unchanged data");
+        !legacy_contract) {
+        const std::string contract_without_dataset =
+            training_contract(config_, search_, saved_batch > 0, true, false);
+        dataset_transition = config_.allow_data_change &&
+            !config_.mix_data.empty() &&
+            saved_contract.size() > contract_without_dataset.size() &&
+            saved_contract.compare(0, contract_without_dataset.size(), contract_without_dataset) == 0 &&
+            saved_contract[contract_without_dataset.size()] == ' ';
+        if (!dataset_transition)
+            throw std::runtime_error("resume training configuration or dataset changed; pass the original training/search options and unchanged data, or use --allow-data-change for an intentional dataset transition");
+    }
+    if (dataset_transition) {
+        // Validation metrics from different datasets are not comparable. The
+        // next phase must establish its own best score and patience history.
+        best_validation_loss_ = std::numeric_limits<double>::max();
+        stale_epochs_ = 0;
+        logger.log("[train] dataset transition; reset validation selection history");
+    }
     if (legacy_contract && saved_batch > 0) {
         const char* reuse_setting = std::getenv("GOMOK_TREE_REUSE");
         logger.log("[train] checkpoint predates subtree reuse; applying GOMOK_TREE_REUSE=%d",
@@ -276,6 +299,18 @@ void Trainer::add_samples(const std::vector<std::vector<Exp>>& batches) {
     for (const auto& game : batches) for (const auto& sample : game) {
         if (buffer_.size() < static_cast<size_t>(config_.buffer_size)) buffer_.push_back(sample);
         else { buffer_[buf_head_] = sample; buf_head_ = (buf_head_ + 1) % buffer_.size(); }
+    }
+}
+
+void Trainer::add_probe_samples(const std::vector<std::vector<Exp>>& batches) {
+    // Keep the newest held-out batches: the probe must track the policy that is
+    // currently being trained, not the one that started the run.
+    for (const auto& game : batches) for (const auto& sample : game) {
+        if (selfplay_probe_.size() < kSelfplayProbeCap) selfplay_probe_.push_back(sample);
+        else {
+            selfplay_probe_[probe_head_] = sample;
+            probe_head_ = (probe_head_ + 1) % selfplay_probe_.size();
+        }
     }
 }
 double Trainer::learning_rate_for_batch(int batch_index) const {
@@ -364,6 +399,39 @@ Trainer::Metrics Trainer::measure(const std::vector<size_t>& indices) {
     return m;
 }
 
+Trainer::Metrics Trainer::measure_selfplay(const std::vector<Exp>& samples) {
+    Metrics m;
+    if (samples.empty()) return m;
+    const int chunk = std::min(256, config_.batch_size);
+    Batch batch(chunk);
+    std::vector<float> lp(static_cast<size_t>(chunk) * BOARD_CELLS), values(chunk);
+    for (size_t off = 0; off < samples.size(); off += chunk) {
+        const int n = static_cast<int>(std::min<size_t>(chunk, samples.size() - off));
+        for (int i = 0; i < n; ++i)
+            std::memcpy(batch.states.data() + static_cast<size_t>(i) * kState,
+                        samples[off + i].state.data(), kState * sizeof(float));
+        net_.forward_batch(batch.states.data(), n, lp.data(), values.data());
+        for (int i = 0; i < n; ++i) {
+            const Exp& sample = samples[off + i];
+            const float* logits = lp.data() + static_cast<size_t>(i) * BOARD_CELLS;
+            for (int c = 0; c < BOARD_CELLS; ++c) {
+                m.policy -= sample.probs[c] * logits[c];
+                m.entropy -= std::exp(logits[c]) * logits[c];
+            }
+            const double diff = values[i] - sample.z;
+            m.value += diff * diff;
+            m.accuracy += std::max_element(logits, logits + BOARD_CELLS) - logits ==
+                          std::max_element(sample.probs.begin(), sample.probs.end()) - sample.probs.begin();
+            ++m.samples;
+        }
+    }
+    if (m.samples) {
+        m.policy /= m.samples; m.value /= m.samples;
+        m.accuracy /= m.samples; m.entropy /= m.samples;
+    }
+    return m;
+}
+
 void Trainer::record_metrics(const char* phase, int index, const Metrics& train, const Metrics& val) {
     const auto dir = std::filesystem::path("runs") / config_.tag;
     std::filesystem::create_directories(dir);
@@ -375,21 +443,30 @@ void Trainer::record_metrics(const char* phase, int index, const Metrics& train,
     file << std::setprecision(9) << phase << ',' << index << ',' << train.samples << ',' << val.samples
          << ',' << train.policy << ',' << val.policy << ',' << train.value << ',' << val.value
          << ',' << train.accuracy << ',' << val.accuracy << ',' << train.entropy << ',' << val.entropy
-         << ',' << (mix_value_weight_ > 0 ? config_.value_loss_weight : 0) << '\n';
+         << ',' << config_.select_value_weight << '\n';
     file.flush();
     file.close();
     if (!file) throw std::runtime_error("cannot write training metrics");
 }
 double Trainer::validate(const char* phase, int index) {
-    if (validation_probe_.empty()) return std::numeric_limits<double>::quiet_NaN();
+    if (validation_probe_.empty() && selfplay_probe_.empty())
+        return std::numeric_limits<double>::quiet_NaN();
     const auto train = measure(training_probe_);
     const auto val = measure(validation_probe_);
-    const double weight = mix_value_weight_ > 0 ? config_.value_loss_weight : 0;
-    logger.log("[val] %s %d train_policy:%.5f val_policy:%.5f gap:%+.5f train_top1:%.4f val_top1:%.4f value_mse:%.5f value_enabled:%d samples:%zu",
+    const auto probe = measure_selfplay(selfplay_probe_);
+    // Human-game outcomes are value supervision only when the dataset says so.
+    // With value_weight 0 the mix value MSE is measured against targets this
+    // pipeline deliberately ignores, so selection must not weight it.
+    const bool mix_value = mix_value_weight_ > 0;
+    const double policy_term = val.samples ? val.policy : probe.policy;
+    const double value_term = probe.samples ? probe.value : (mix_value ? val.value : 0.0);
+    const double score = policy_term + config_.select_value_weight * value_term;
+    logger.log("[val] %s %d train_policy:%.5f val_policy:%.5f gap:%+.5f train_top1:%.4f val_top1:%.4f value_mse:%.5f value_enabled:%d samples:%zu select_value_weight:%.3f probe_samples:%zu probe_policy:%.5f probe_value:%.5f score:%.5f",
         phase, index, train.policy, val.policy, val.policy - train.policy, train.accuracy,
-        val.accuracy, val.value, mix_value_weight_ > 0 ? 1 : 0, val.samples);
+        val.accuracy, val.value, mix_value ? 1 : 0, val.samples, config_.select_value_weight,
+        probe.samples, probe.policy, probe.value, score);
     record_metrics(phase, index, train, val);
-    return val.objective(weight);
+    return score;
 }
 
 void Trainer::run_pretrain() {
@@ -522,7 +599,12 @@ void Trainer::run() {
         const auto batch_start = Clock::now();
         const auto batches = sp.run_batch();
         const double play_seconds = elapsed(batch_start);
-        add_samples(batches);
+        // A probe batch is withheld from the replay buffer so the value metric
+        // stays independent of the weights being selected.
+        const bool probe_due = config_.selfplay_val_every > 0 &&
+                               (i + 1) % config_.selfplay_val_every == 0 && !buffer_.empty();
+        if (probe_due) add_probe_samples(batches);
+        else add_samples(batches);
         size_t count = 0;
         for (const auto& game : batches) count += game.size();
         policy_update(i);
@@ -531,7 +613,26 @@ void Trainer::run() {
                    elapsed(batch_start) - play_seconds);
         const bool arena_due = config_.eval_games > 0 && (i + 1) % config_.eval_freq == 0;
         if ((i + 1) % config_.check_freq == 0 || arena_due) save_checkpoint(checkpoint_dir(), i + 1);
-        if (config_.validation_freq > 0 && (i + 1) % config_.validation_freq == 0) validate("selfplay", i + 1);
+        if (config_.validation_freq > 0 && (i + 1) % config_.validation_freq == 0) {
+            const double score = validate("selfplay", i + 1);
+            const bool selection_ready = config_.select_value_weight <= 0 ||
+                mix_value_weight_ > 0 || !selfplay_probe_.empty();
+            // The periodic checkpoint is "the last batch", which is not the
+            // same as the best one: keep an independently selected snapshot.
+            if (std::isfinite(score) && !selection_ready) {
+                logger.log("[validate] batch %d waiting for a self-play value probe before selection",
+                           i + 1);
+            } else if (std::isfinite(score) && score < best_validation_loss_ - 1e-5) {
+                best_validation_loss_ = score;
+                const std::string best = "best_policy_" + config_.tag + "_val_bin";
+                save_checkpoint(best, i + 1);
+                logger.log("[validate] batch %d improved the selection score to %.5f (best); saved: %s",
+                           i + 1, score, best.c_str());
+            } else if (std::isfinite(score)) {
+                logger.log("[validate] batch %d selection score %.5f did not improve on best %.5f",
+                           i + 1, score, best_validation_loss_);
+            }
+        }
 
         // Measure ordinary batch work separately from arena matches, then
         // forecast future scheduled matches explicitly. This avoids a sharp

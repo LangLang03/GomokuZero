@@ -59,4 +59,15 @@ void transform_sample(const float* state, const float* policy, float* out_state,
                       float* out_policy, int symmetry, float smoothing = 0.0f);
 uint64_t canonical_state_hash(const float* state);
 
+// Write a self-play dataset in the exact [u64 count][elements] layout the
+// loader reads. Every record is re-validated, an existing prefix is refused,
+// and the metadata enables value supervision because z is a real freestyle
+// game outcome produced by search rather than a human record under other rules.
+void write_selfplay_dataset(const std::string& prefix,
+                            const std::vector<float>& states,
+                            const std::vector<float>& policies,
+                            const std::vector<float>& outcomes,
+                            const std::vector<uint64_t>& game_ids,
+                            const std::string& source);
+
 }  // namespace gomoku

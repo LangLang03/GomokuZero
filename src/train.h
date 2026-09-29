@@ -37,12 +37,18 @@ struct TrainConfig {
     int validation_freq = 5;
     int validation_samples = 2048;  // 0 evaluates the whole held-out partition
     int kl_freq = 5;                // 0 disables the observational probe
+    // Selection controls. Deliberately outside training_contract: they decide
+    // which snapshot is kept, not the numerical experiment, so a checkpoint
+    // saved before these options existed can still resume with them enabled.
+    double select_value_weight = 0.0;  // weight of the value term in the selection score
+    int selfplay_val_every = 0;        // hold out every Nth self-play batch as a probe (0 disables)
     int eval_games = 0;
     int eval_freq = 50;
     int eval_playout = 400;
     std::string baseline_dir;
     std::string tag = "cpp";
     std::string resume_dir;
+    bool allow_data_change = false; // explicit supervised-stage dataset transition on resume
 };
 
 // Validate before constructing a network or allocating training buffers.
@@ -66,6 +72,11 @@ private:
     std::unique_ptr<PureNet> baseline_;
     float mix_value_weight_ = 0;
     std::vector<size_t> validation_probe_, training_probe_;
+    // Self-play positions withheld from the replay buffer. Human-game outcomes
+    // are not value supervision when the dataset declares value_weight 0, so
+    // this probe is the only honest value signal available to selection.
+    std::vector<Exp> selfplay_probe_;
+    size_t probe_head_ = 0;
     std::vector<float> kl_states_, kl_before_;
     int n_kl_ = 0;
     int pretrain_completed_ = 0;
@@ -83,9 +94,11 @@ private:
     void restore_trainer_state();
     void save_checkpoint(const std::string& dir, int batch_idx);
     void add_samples(const std::vector<std::vector<Exp>>& batches);
+    void add_probe_samples(const std::vector<std::vector<Exp>>& batches);
     void policy_update(int batch_index);
     void run_pretrain();
     Metrics measure(const std::vector<size_t>& indices);
+    Metrics measure_selfplay(const std::vector<Exp>& samples);
     double validate(const char* phase, int index);
     void record_metrics(const char* phase, int index, const Metrics& train, const Metrics& val);
     double run_arena(int batch_idx);

@@ -8,6 +8,7 @@
 #include <map>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <unordered_map>
@@ -421,6 +422,85 @@ void transform_sample(const float* s, const float* p, float* os, float* op,
         for (int c = 0; c < BOARD_CELLS; ++c)
             op[c] = (os[c] || os[BOARD_CELLS + c]) ? 0.0f :
                     (1 - smoothing) * op[c] + smoothing / legal;
+    }
+}
+
+namespace {
+void write_binary_file(const std::string& path, const void* payload, size_t elements,
+                       size_t element_bytes) {
+    const std::string temporary = path + ".tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot write dataset file: " + temporary);
+    const uint64_t count = static_cast<uint64_t>(elements);
+    output.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    output.write(static_cast<const char*>(payload),
+                 static_cast<std::streamsize>(elements * element_bytes));
+    output.flush();
+    if (!output) throw std::runtime_error("cannot write dataset payload: " + temporary);
+    output.close();
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    if (error) {
+        std::filesystem::remove(temporary);
+        throw std::runtime_error("cannot publish dataset file: " + path);
+    }
+}
+}  // namespace
+
+void write_selfplay_dataset(const std::string& prefix,
+                            const std::vector<float>& states,
+                            const std::vector<float>& policies,
+                            const std::vector<float>& outcomes,
+                            const std::vector<uint64_t>& game_ids,
+                            const std::string& source) {
+    if (prefix.empty()) throw std::invalid_argument("dataset prefix must not be empty");
+    const size_t n = outcomes.size();
+    if (n == 0) throw std::invalid_argument("refusing to write an empty dataset");
+    if (states.size() != n * 4 * BOARD_CELLS || policies.size() != n * BOARD_CELLS ||
+        game_ids.size() != n)
+        throw std::invalid_argument("dataset arrays disagree on sample count");
+    for (const char* suffix : {"_states.bin", "_probs.bin", "_winners.bin", "_game_ids.bin", "_meta.json"})
+        if (std::filesystem::exists(prefix + suffix))
+            throw std::invalid_argument("refusing to overwrite dataset: " + prefix + suffix);
+    // Re-validate before publishing: a writer bug must not produce a dataset the
+    // loader will later reject in the middle of a training run.
+    for (size_t i = 0; i < n; ++i)
+        validate_training_record(states.data() + i * 4 * BOARD_CELLS,
+                                 policies.data() + i * BOARD_CELLS, outcomes[i], i);
+    size_t games = 0;
+    for (size_t i = 0; i < n; ++i) games += i == 0 || game_ids[i] != game_ids[i - 1];
+    write_binary_file(prefix + "_states.bin", states.data(), states.size(), sizeof(float));
+    write_binary_file(prefix + "_probs.bin", policies.data(), policies.size(), sizeof(float));
+    write_binary_file(prefix + "_winners.bin", outcomes.data(), outcomes.size(), sizeof(float));
+    write_binary_file(prefix + "_game_ids.bin", game_ids.data(), game_ids.size(), sizeof(uint64_t));
+    std::ostringstream metadata;
+    metadata << "{\n"
+             << "  \"format_version\": 2,\n"
+             << "  \"samples\": " << n << ",\n"
+             << "  \"games\": " << games << ",\n"
+             << "  \"source\": \"" << source << "\",\n"
+             << "  \"target_rules\": \"freestyle\",\n"
+             << "  \"rules\": \"freestyle\",\n"
+             << "  \"board_size\": \"15x15\",\n"
+             << "  \"value_supervision\": \"enabled\",\n"
+             << "  \"value_weight\": 1.0,\n"
+             << "  \"has_game_ids\": true\n"
+             << "}\n";
+    const std::string meta_path = prefix + "_meta.json";
+    {
+        const std::string temporary = meta_path + ".tmp";
+        std::ofstream output(temporary, std::ios::trunc);
+        if (!output) throw std::runtime_error("cannot write dataset metadata: " + temporary);
+        output << metadata.str();
+        output.flush();
+        if (!output) throw std::runtime_error("cannot write dataset metadata: " + temporary);
+        output.close();
+        std::error_code error;
+        std::filesystem::rename(temporary, meta_path, error);
+        if (error) {
+            std::filesystem::remove(temporary);
+            throw std::runtime_error("cannot publish dataset metadata: " + meta_path);
+        }
     }
 }
 }  // namespace gomoku

@@ -1,4 +1,5 @@
 #include "game.h"
+#include "logger.h"
 #include "network.h"
 #include "selfplay.h"
 #include "train.h"
@@ -21,8 +22,12 @@ void usage() {
         "Usage: gomoku_train <train|selfplay|arena|human|export> [options]\n"
         "train: --init DIR --games N --batch-games 64 --playout 400\n"
         "  --mix PREFIX --mix-ratio 0.5 --mix-value-weight [0,1]\n"
+        "  --allow-data-change permits an explicit resumed dataset transition\n"
         "  --pretrain EPOCHS --pretrain-warmup 20 --early-stop-patience 0\n"
         "  --val-fraction 0.1 --val-freq 5 --val-samples 2048 --infer-game-groups 0|1\n"
+        "  --select-value-weight 0 --selfplay-val-every 0 (value-weighted checkpoint selection;\n"
+        "    the probe holds out every Nth self-play batch and is the honest value signal\n"
+        "    whenever the mix dataset declares value_weight 0)\n"
         "  --batch-size 512 --epochs 5 --buffer 10000 --check-freq 50 --tag NAME\n"
         "  --lr 0.002 --lr-final-fraction 0.1 --lr-warmup 2 --weight-decay 0.0001\n"
         "  --precision fp32|bf16 (default fp32)\n"
@@ -30,7 +35,8 @@ void usage() {
         "  --eval-games 0 --eval-freq 50 --eval-playout 400 --baseline DIR\n"
         "  --games is the absolute final batch index; --games 0 trains supervised only.\n"
         "  --epochs means fresh optimizer minibatches per self-play batch.\n"
-        "selfplay: [--model DIR] --games 4 --batch 4 (random model if omitted)\n"
+        "selfplay: [--model DIR] --games 4 --batch 4 [--output PREFIX] (random model if omitted;\n"
+        "  --output writes an audited dataset whose z enables value supervision)\n"
         "arena: --model DIR --baseline DIR --games 40 --playout 400 --opening-moves 4\n"
         "human: --model DIR --playout 400 (moves r,c, zero based)\n"
         "export: [--model DIR] --output DIR (random initialized weights if omitted)\n"
@@ -46,7 +52,7 @@ public:
             const std::string key = argv[i];
             if (key.size() < 3 || key.substr(0, 2) != "--") throw std::invalid_argument("expected option, got: " + key);
             if (values_.count(key)) throw std::invalid_argument("duplicate option: " + key);
-            if (key == "--cpu" || key == "--help") values_[key] = "1";
+            if (key == "--cpu" || key == "--help" || key == "--allow-data-change") values_[key] = "1";
             else {
                 if (i + 1 == argc || std::string(argv[i + 1]).rfind("--", 0) == 0)
                     throw std::invalid_argument("missing value for " + key);
@@ -131,6 +137,7 @@ int train(Options& o) {
     c.seed = o.seed();
     const bool cpu = o.boolean("--cpu", false);
     c.resume_dir = o.str("--init");
+    c.allow_data_change = o.boolean("--allow-data-change", false);
     c.mix_data = o.str("--mix");
     c.tag = o.str("--tag", c.tag);
     c.game_batch_num = o.integer("--games", c.game_batch_num);
@@ -160,6 +167,8 @@ int train(Options& o) {
     c.pretrain_warmup_steps = o.integer("--pretrain-warmup", c.pretrain_warmup_steps);
     c.early_stop_patience = o.integer("--early-stop-patience", c.early_stop_patience);
     c.kl_freq = o.integer("--kl-freq", c.kl_freq);
+    c.select_value_weight = o.real("--select-value-weight", c.select_value_weight);
+    c.selfplay_val_every = o.integer("--selfplay-val-every", c.selfplay_val_every);
     c.eval_games = o.integer("--eval-games", c.eval_games);
     c.eval_freq = o.integer("--eval-freq", c.eval_freq);
     c.eval_playout = o.integer("--eval-playout", c.eval_playout);
@@ -179,6 +188,7 @@ int selfplay(Options& o) {
     o.seed();
     const bool cpu = o.boolean("--cpu", false);
     const auto model = o.str("--model");
+    const auto output = o.str("--output");
     const int games = o.integer("--games", 4);
     s.batch_games = o.integer("--batch", 4);
     o.finish();
@@ -191,16 +201,39 @@ int selfplay(Options& o) {
     const auto start = std::chrono::steady_clock::now();
     int played = 0, moves = 0;
     uint64_t batch_index = 0;
+    std::vector<float> states, policies, outcomes;
+    std::vector<uint64_t> game_ids;
     while (played < games) {
         auto batch_config = s;
         batch_config.batch_games = std::min(s.batch_games, games - played);
         BatchedSelfPlay sp(net, batch_config);
         sp.set_batch_counter(batch_index++);
         const auto result = sp.run_batch();
-        for (const auto& game : result) { ++played; moves += game.size(); }
+        for (const auto& game : result) {
+            ++played; moves += game.size();
+            if (output.empty()) continue;
+            const uint64_t game_id = game_ids.empty() ? 0 : game_ids.back() + 1;
+            for (const auto& sample : game) {
+                states.insert(states.end(), sample.state.begin(), sample.state.end());
+                policies.insert(policies.end(), sample.probs.begin(), sample.probs.end());
+                outcomes.push_back(sample.z);
+                game_ids.push_back(game_id);
+            }
+        }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::cout << "played " << played << '/' << games << " seconds=" << seconds
-                  << " seconds/game=" << seconds / played << " moves/game=" << static_cast<double>(moves) / played << '\n';
+        const double per_game = seconds / played;
+        // logger flushes every line: a redirected stdout would otherwise hold
+        // thousands of games of progress inside a block buffer.
+        logger.log("played %d/%d (%.1f%%) seconds=%.1f s/game=%.3f moves/game=%.1f eta=%.1f min",
+                   played, games, 100.0 * played / games, seconds, per_game,
+                   static_cast<double>(moves) / played, per_game * (games - played) / 60.0);
+    }
+    if (!output.empty()) {
+        write_selfplay_dataset(output, states, policies, outcomes, game_ids,
+                               "selfplay playout=" + std::to_string(s.n_playout) +
+                               (model.empty() ? " random_model" : " model=" + model));
+        std::cout << "wrote " << outcomes.size() << " samples from " << played
+                  << " games to " << output << "_*.bin" << std::endl;
     }
     return 0;
 }

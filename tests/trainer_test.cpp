@@ -24,6 +24,12 @@ int main() {
         { auto x = c; x.eval_games = 3; x.baseline_dir="somewhere"; rejects([&] { validate_train_config(x,s); }); }
         { auto x = s; x.eval_opening_moves = 9; rejects([&] { validate_train_config(c,x); }); }
         { auto x = s; x.virtual_loss = 2000; rejects([&] { validate_train_config(c,x); }); }
+        for (double bad : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+            auto x = c; x.select_value_weight = bad;
+            rejects([&] { validate_train_config(x,s); });
+        }
+        { auto x = c; x.selfplay_val_every = -1; rejects([&] { validate_train_config(x,s); }); }
+        { auto x = c; x.selfplay_val_every = 5; x.select_value_weight = 1.0; validate_train_config(x,s); }
         { auto x = c; x.game_batch_num = 0; x.pretrain_epochs=1; x.mix_data="dataset"; validate_train_config(x,s); }
         const double base = 0.002, floor = 0.0002;
         auto lr = [&](int step) { return scheduled_learning_rate(base, .1, 2, 10, step); };

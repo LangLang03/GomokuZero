@@ -1,0 +1,12 @@
+{
+  "format_version": 2,
+  "samples": 51755,
+  "games": 3000,
+  "source": "selfplay playout=400 model=best_policy_quality5000_20260926_bin",
+  "target_rules": "freestyle",
+  "rules": "freestyle",
+  "board_size": "15x15",
+  "value_supervision": "enabled",
+  "value_weight": 1.0,
+  "has_game_ids": true
+}
