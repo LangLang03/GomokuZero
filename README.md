@@ -5,7 +5,7 @@
 
 A from-scratch AlphaZero-style engine for **15×15 freestyle Gomoku** (five or more in a row wins, no Renju forbidden moves, no swap openings). Board, PUCT/MCTS, batched self-play, dataset pipeline, trainer, checkpointing, arena and CLI are C++17; the neural network runs through LibTorch/CUDA for training and through a native folded-BN CPU path for inference. A Python toolchain prepares the human-game dataset, exports ONNX and serves a browser/terminal opponent.
 
-The starting point was the well-known Python project [junxiaosong/AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku). On the laptop described below, one comparable 15×15 training campaign took **about 3 days** there and **about 2.5 hours** here — see [Results at a glance](#results-at-a-glance) and [Why it is fast](#why-it-is-fast-the-optimization-list) for what is measured and what is mechanism.
+The starting point was the well-known Python project [junxiaosong/AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku). On the laptop described below, one comparable 15×15 training campaign took **about 7 days** there and **about 14 hours** here — see [Results at a glance](#results-at-a-glance) and [Why it is fast](#why-it-is-fast-the-optimization-list) for what is measured and what is mechanism.
 
 | | |
 |---|---|
