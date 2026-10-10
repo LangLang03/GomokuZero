@@ -5,7 +5,7 @@
 
 从零实现的 **15×15 自由规则五子棋** AlphaZero 引擎（五连或更长即胜，无连珠禁手、无交换开局）。棋盘、PUCT/MCTS、批量自对弈、数据管线、训练器、检查点、竞技场与 CLI 全部是 C++17；神经网络训练走 LibTorch/CUDA，推理走原生「BN 折合」CPU 路径。Python 工具链负责人类棋谱处理、ONNX 导出以及浏览器/终端对弈服务。
 
-起点是著名的 Python 项目 [junxiaosong/AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku)。在下文这台笔记本上，一次同等规模的 15×15 训练在那里约需 **3 天**，在这里约 **2.5 小时** —— 实测口径与机制说明见[结果速览](#结果速览)和[为什么快：优化清单](#为什么快优化清单)。
+起点是著名的 Python 项目 [junxiaosong/AlphaZero_Gomoku](https://github.com/junxiaosong/AlphaZero_Gomoku)。在下文这台笔记本上，一次同等规模的 15×15 训练在那里约需 **7 天**，在这里约 **14 小时** —— 实测口径与机制说明见[结果速览](#结果速览)和[为什么快：优化清单](#为什么快优化清单)。
 
 | | |
 |---|---|
